@@ -94,9 +94,6 @@ class LlamaAttention_KIVI(nn.Module):
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
             )
         bsz, q_len, _ = hidden_states.size()
-        if torch.isinf(hidden_states).any():
-            print(f"Layer {self.layer_idx} has NaN values in hidden_states") 
-            raise ValueError(f"Layer {self.layer_idx} has NaN values in hidden_states")
 
         if self.config.pretraining_tp > 1:
             key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
@@ -125,9 +122,6 @@ class LlamaAttention_KIVI(nn.Module):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        if torch.isinf(query_states).any():
-            print(f"Layer {self.layer_idx} has NaN values in query_states before rotatory") 
-            raise ValueError(f"Layer {self.layer_idx} has NaN values in query_states before rotatory")
 
         kv_seq_len = key_states.shape[-2]
         kv_seq_len += kv_cache.seq_len
@@ -135,12 +129,6 @@ class LlamaAttention_KIVI(nn.Module):
         #     kv_seq_len += past_key_value[-1]
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        if torch.isinf(query_states).any():
-            print(f"Layer {self.layer_idx} has NaN values in query_states rotatory") 
-            raise ValueError(f"Layer {self.layer_idx} has NaN values in query_states rotatory")
-        if torch.isinf(key_states).any():
-            print(f"Layer {self.layer_idx} has NaN values in key_states rotatory") 
-            raise ValueError(f"Layer {self.layer_idx} has NaN values in key_states rotatory")
         assert self.num_key_value_groups == 1
         # [bsz, nh, t, hd]
         # if kv_cache is not None:
@@ -156,23 +144,8 @@ class LlamaAttention_KIVI(nn.Module):
             value_mn = past_key_value[7]
 
             if key_states_quant_trans is not None:
-                if torch.isinf(key_states_quant_trans).any():
-                    print(f"Layer {self.layer_idx} has NaN values in key_states_quant_trans") 
-                    raise ValueError(f"Layer {self.layer_idx} has NaN values in key_states_quant_trans")
-                if torch.isinf(query_states).any():
-                    print(f"Layer {self.layer_idx} has NaN values in query_states") 
-                    raise ValueError(f"Layer {self.layer_idx} has NaN values in query_states")
-                if torch.isinf(key_scale_trans).any():
-                    print(f"Layer {self.layer_idx} has NaN values in key_scale_trans") 
-                    raise ValueError(f"Layer {self.layer_idx} has NaN values in key_scale_trans")
-                if torch.isinf(key_mn_trans).any():
-                    print(f"Layer {self.layer_idx} has NaN values in key_mn_trans") 
-                    raise ValueError(f"Layer {self.layer_idx} has NaN values in key_mn_trans")
                 att_qkquant = cuda_bmm_fA_qB_outer(self.group_size, query_states, key_states_quant_trans, 
                                 key_scale_trans, key_mn_trans, self.k_bits)
-                if torch.isinf(att_qkquant).any():
-                    print(f"Layer {self.layer_idx} has NaN values in att_qkquant") 
-                    raise ValueError(f"Layer {self.layer_idx} has NaN values in att_qkquant") 
             else:
                 att_qkquant = None
 
@@ -205,9 +178,6 @@ class LlamaAttention_KIVI(nn.Module):
 
             # upcast attention to fp32
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            print(self.layer_idx, attn_weights.shape, attn_weights.min(), attn_weights.max())
-            if torch.isinf(attn_weights).any():
-                print(f"Layer {self.layer_idx} has NaN values in attention weights")            # value_states_full = torch.cat([value_states_full, value_states], dim=2)
             value_full_length = value_states_full.shape[-2]
             if value_states_quant is None:
                 attn_output = torch.matmul(attn_weights, value_states_full)
@@ -581,9 +551,6 @@ class LlamaDecoderLayer_KIVI(nn.Module):
 
         hidden_states = self.input_layernorm(hidden_states)
 
-        if torch.isinf(hidden_states).any():
-            print(f"Layer has NaN values in hidden_states") 
-            raise ValueError(f"Layer has NaN values in hidden_states")
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -600,20 +567,10 @@ class LlamaDecoderLayer_KIVI(nn.Module):
 
         # Fully Connected
         residual = hidden_states
-        if torch.isinf(hidden_states).any():
-            print(f"Layer has NaN values in hidden_states") 
-            raise ValueError(f"Layer has NaN values in hidden_states")
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if torch.isinf(hidden_states).any():
-            print(f"Layer has NaN values in hidden_states") 
-            raise ValueError(f"Layer has NaN values in hidden_states")
-        print(f"hidden_states after post_attention_layernorm: {hidden_states.max(), hidden_states.dtype, hidden_states.min()}")
         hidden_states = self.mlp(hidden_states)
         
                 # Print MLP parameters max and min
-        print(f"MLP gate_proj weight: max={self.mlp.gate_proj.weight.max().item():.4f}, min={self.mlp.gate_proj.weight.min().item():.4f}")
-        print(f"MLP up_proj weight: max={self.mlp.up_proj.weight.max().item():.4f}, min={self.mlp.up_proj.weight.min().item():.4f}")
-        print(f"MLP down_proj weight: max={self.mlp.down_proj.weight.max().item():.4f}, min={self.mlp.down_proj.weight.min().item():.4f}")
         if torch.isinf(hidden_states).any():
             print(f"Layer has NaN values in hidden_states") 
             raise ValueError(f"Layer has NaN values in hidden_states")
@@ -692,6 +649,7 @@ class LlamaModel_KIVI(LlamaPreTrainedModel):
         past_key_values_length = 0
         # if past_key_values is not None:
         #     past_key_values_length = past_key_values[0][-1]
+        assert kv_cache is not None
         if kv_cache is not None:
             past_key_values_length = kv_cache.seq_len
 

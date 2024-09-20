@@ -17,6 +17,169 @@ class Cache:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError("Make sure to implement `update` in a subclass.")
 
+def quant_fn_nuq_recon(
+    inp,
+    bits=8,
+    qchannel = -1,
+    outlier_mask=None,
+    maxval=-1,
+    minval=-1,
+    lut=None,
+):
+
+
+    # set quantization threshold dynamically
+    if dynamicquantization:
+        if include_sparse:
+            outliers = inp * outlier_mask
+            median = torch.median(inp, dim=qchannel).values
+            median = median.unsqueeze(qchannel)
+            median_mask = median * outlier_mask
+
+            # recenter using mean to avoid having outliers skew quant distribution
+            tmp_inp = inp - outliers + median_mask
+            maxval = torch.max(tmp_inp, dim=qchannel).values
+            minval = torch.min(tmp_inp, dim=qchannel).values
+        else:
+            maxval = torch.max(inp, dim=qchannel).values
+            minval = torch.min(inp, dim=qchannel).values
+
+    # compute offset here:
+    offset = (maxval + minval) / 2
+    rangeval = (maxval - minval) / 2
+    offset = offset.unsqueeze(qchannel)
+    rangeval = rangeval.unsqueeze(qchannel)
+
+    # subtract offset
+    inp = inp - offset
+
+    # need to handle outlier removal here due to issues with zeroing out non-outliers
+    if include_sparse:
+        outliers = inp * outlier_mask
+        inp = inp - outliers
+
+    #dividing by range to normalize to [-1,1]
+    inp_scaled = inp / rangeval
+
+    # round to nearest LUT entry
+    lut_cuda = torch.tensor(lut[0]).to(inp_scaled.device)
+    Q = round_to_nearest_pole_sim(inp_scaled.flatten(), lut_cuda)
+    qinp_out = Q.reshape(inp.shape).float().to(inp_scaled.device)
+
+    if norm:
+        normscale = normscale.to(inp_scaled.device)
+        normoffset = normoffset.to(inp_scaled.device)
+        qinp_out = qinp_out*normscale + normoffset
+
+    # un-normalize
+    qinp_out = qinp_out * rangeval
+
+    # add outliers back
+    if include_sparse:
+        qinp_out[outlier_mask] = 0
+        qinp_out = qinp_out + outliers
+
+    #shift by offset
+    qinp_out = qinp_out + offset
+    qinp_out = torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0) #TODO: debug (shouldn't be necessary)
+
+    # leave first few in fp16
+    # leave this here for now -> avoids any small perturbations from rescaling
+    if first_few_fp16 > -1:
+        qinp_out[:first_few_fp16,:] = orig[:first_few_fp16,:]
+
+    return qinp_out.float()
+
+class SimquantCache(Cache):
+    def __init__(self, model, quantizers, max_budget=1024) -> None:
+        self.seq_len = 0
+        self.quant_key_len = 0
+        self.quant_val_len = 0
+        self.residual_length = model.config.residual_length
+        # self.num_key_value_heads = model.config.num_key_value_heads
+        self.k_bits = model.config.k_bits
+        self.v_bits = model.config.v_bits
+        self.max_budget = max_budget
+
+        self.hidden_size = model.config.hidden_size
+        self.num_heads = model.config.num_key_value_heads
+        self.head_dim = self.hidden_size // model.config.num_attention_heads
+        self.layers = model.config.num_hidden_layers
+        self.quantizers = quantizers
+
+        dtype = model.model.layers[0].self_attn.q_proj.weight.dtype
+        self.key_states = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim], dtype=dtype).to(model.device)
+        self.value_states = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim], dtype=dtype).to(model.device)
+
+        self.outlier_threshold_upper_keys = torch.zeros([self.layers, 1, self.head_dim*self.num_heads], dtype=dtype).to(model.device)
+        self.outlier_threshold_lower_keys = torch.zeros([self.layers, 1, self.head_dim*self.num_heads], dtype=dtype).to(model.device)
+        self.lut_keys = torch.zeros([self.layers, 2**self.k_bits, 1], dtype=dtype).to(model.device)
+
+        self.outlier_threshold_upper_values = torch.zeros([self.layers, 32768, 1], dtype=dtype).to(model.device)
+        self.outlier_threshold_lower_values = torch.zeros([self.layers, 32768, 1], dtype=dtype).to(model.device)
+        self.lut_values = torch.zeros([self.layers, 2**self.v_bits, 1], dtype=dtype).to(model.device)
+        self.init_simquant(quantizers)
+
+    def print_status(self):
+        print("[Full Cache] Cached:", self.seq_len, "| Quantized:", self.quant_key_len, self.quant_val_len, "| full_precision:", self.seq_len-self.quant_key_len, self.seq_len-self.quant_val_len)
+
+    def reset(self):
+        self.seq_len = 0
+        self.quant_key_len = 0
+        self.quant_val_len = 0
+        self.key_states.zero_()
+        self.value_states.zero_()
+    
+    def update(self, key_states, value_states, layer_idx):
+        # print(key_states.shape, value_states.shape)
+
+        self.key_states[layer_idx][:, :, self.seq_len : self.seq_len + key_states.shape[-2]] = key_states
+        self.value_states[layer_idx][:, :, self.seq_len : self.seq_len + value_states.shape[-2]] = value_states
+
+        
+        if self.quant_key_len == 0:
+            output = (None, self.key_states[layer_idx][:,:, :self.seq_len+key_states.shape[-2]], None, None,)
+        else:
+            output = (
+                self.key_states[layer_idx][:,:, :, :self.quant_key_len],
+                self.key_states[layer_idx][:,:, self.quant_key_len:self.seq_len+key_states.shape[-2]],
+            )
+        if self.quant_val_len == 0:
+            output += (None, self.value_states_full[layer_idx][:,:, :self.seq_len+value_states.shape[-2]], None, None)
+        else:
+            output += (
+                self.value_states[layer_idx][:,:, :self.quant_val_len],
+                self.value_states[layer_idx][:,:, self.quant_val_len:self.seq_len+value_states.shape[-2]],
+            )
+        if layer_idx == self.layers-1:
+            self.seq_len += key_states.size(2)
+        return output
+    
+    def quantize_and_pack(self):
+    
+        full_val_len = self.seq_len - self.quant_val_len
+        if full_val_len > self.residual_length:
+            to_quant_len = full_val_len-self.residual_length
+            for layer_idx in range(self.layers):
+                value_states_to_quant = self.value_states[layer_idx][:, :, self.quant_val_len:to_quant_len]                
+                self.value_states[layer_idx][:, :, self.quant_val_len:to_quant_len] = self.simquant(
+                    value_states_to_quant, self.v_bits, layer_idx)
+            self.quant_val_len += to_quant_len
+
+        full_key_len = self.seq_len - self.quant_key_len
+        if full_key_len > self.residual_length:
+            to_quant_len = full_key_len-self.residual_length
+            for layer_idx in range(self.layers):
+                key_states_to_quant = self.key_states[layer_idx][:, :, self.quant_key_len:to_quant_len]
+                self.key_states[layer_idx][:, :, self.quant_key_len:to_quant_len] = self.simquant(
+                    key_states_to_quant, self.k_bits, layer_idx)
+            self.quant_key_len += to_quant_len
+
+
+    def init_simquant(self, quantizer):
+        self.outlier_threshold_upper = [torch.tensor(quantizer[0]).cuda().flatten().half() for _ in range(self.layers)]
+        self.outlier_threshold_lower = torch.tensor(quantizer[1]).cuda().flatten().half()
+                
 class QCache(Cache):
     def __init__(self, model, max_budget=1024) -> None:
         self.seq_len = 0
@@ -63,13 +226,10 @@ class QCache(Cache):
         self.value_mn.zero_()
     
     def update(self, key_states, value_states, layer_idx):
-        # print(key_states.shape, value_states.shape)
 
         self.key_states_full[layer_idx][:, :, self.seq_len-self.quant_key_len : self.seq_len - self.quant_key_len + key_states.shape[-2]] = key_states.contiguous()
         self.value_states_full[layer_idx][:, :, self.seq_len-self.quant_val_len : self.seq_len - self.quant_val_len + value_states.shape[-2]] = value_states.contiguous()
 
-        
-        
 
         if self.quant_key_len == 0:
             output = (None, self.key_states_full[layer_idx][:,:, :self.seq_len+key_states.shape[-2]], None, None,)

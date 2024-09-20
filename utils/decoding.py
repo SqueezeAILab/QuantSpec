@@ -11,41 +11,130 @@ from utils.misc import spec_stream, log_csv
 from utils.sampling import sample, norm_logits, max_fn
 
 @torch.inference_mode()
-def model_run(model, kv_cache,input_ids: torch.LongTensor):
-    if input_ids.shape[-1] > 64: # prefill
-        iter_prefill = math.ceil(input_ids.shape[1] / 128)
-        for i in range(iter_prefill):
-            kv_cache.print_status()
-            logits = model(
-                input_ids=input_ids[:, i*128:(i+1)*128],
-                kv_cache=kv_cache,
-            ).logits
-            kv_cache.quantize_and_pack()
-    else: # verification
-        logits = model(input_ids=input_ids, kv_cache=kv_cache).logits
-        # kv_cache.quantize_and_pack()
-    return logits
+def SpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, top_k=-1, top_p=0.9, temperature=0.6, verbose=False, file_path=None, dataset=None, spec_args=None):
+    spec_engine.clear_kv()
 
-@torch.inference_mode()
-def TestQuant(tokenizer, model, qcache, input_ids, max_len=256, top_k=-1, top_p=0.9, temperature=0.6, verbose=True):
-    qcache.reset()
-    logits = model_run(model, qcache, input_ids)
-    next_token = sample(norm_logits(logits[:,-1,:], temperature=temperature ,top_k=top_k, top_p=top_p))
+    logits = spec_engine.inference(input_ids=input_ids[:,:-1])
+    logits = spec_engine.inference(input_ids=input_ids[:,-1:])
+    _ = spec_engine.draft_prefill(input_ids=input_ids)
+    # spec_engine.draft_cache.quantize_and_pack()
+
     if verbose:
-        qcache.print_status()
+        spec_engine.engine.target_cache.print_status()
+        spec_engine.engine.draft_cache.print_status()
 
+    next_token = sample(norm_logits(logits[:,-1,:], temperature=temperature ,top_k=top_k, top_p=top_p))
+    
+    if verbose:
+        spec_stream(next_token[0], tokenizer, 'cyan')
+
+    accepted_count = 0
+    draft_count = 0
+    resample_count = 0
     n = 0
     time1 = time.time()
     while n < max_len:
-        logits = model_run(model, qcache, input_ids=next_token)
-        # qcache.quantize_and_pack()
+        pred_token_idx = next_token.squeeze()
+        if next_token.shape == torch.Size([1]):
+            next_token = next_token.unsqueeze(0)
         
-        next_token = sample(norm_logits(logits[:,-1,:], temperature=temperature ,top_k=top_k, top_p=top_p))
-        n += 1
-        # if verbose:
-        #     spec_stream(next_token[0], tokenizer, 'cyan')
+        verify_tokens = torch.full((1, gamma+1), 100, device=spec_engine.engine.draft.device)
+        verify_tokens[:, 0] = next_token
+        speculation_probs = []
+        for i in range(gamma):
+            logits = spec_engine.draft_inference(input_ids=verify_tokens[:,i:i+1])
+            prob = norm_logits(logits[:,-1,:], temperature=temperature ,top_k=top_k, top_p=top_p).squeeze()
+            speculation_probs.append(prob)
+            next_token = sample(prob)
+            verify_tokens[:, i+1] = next_token.item()
+            # draft_count += 1
+        draft_count += gamma
+        # generated_ids = verify_tokens[1:]
+        # gamma2 = len(generated_ids)
+        logits = spec_engine.inference(input_ids=verify_tokens)
+
+        count = 0
+
+        verify_probs = []
+        # print('logits.shape', logits.shape)
+        probs = norm_logits(logits[0], temperature=temperature ,top_k=top_k, top_p=top_p)
+
+        # print('probs.shape', probs.shape)
+        for i in range(gamma + 1):
+            verify_probs.append(probs[i])
+
+        for i in range(gamma):
+            print(f'verify_probs[{i}]: {verify_probs[i].max()}, {verify_probs[i].min()}')
+            print(f'speculation_probs[{i}]: {speculation_probs[i].max()}, {speculation_probs[i].min()}')
+        
+        # print('verify_probs', verify_probs[0].shape)
+        for i, speculation_prob, verify_prob in zip(verify_tokens[0,1:], speculation_probs, verify_probs):
+            r = torch.rand(1, device = spec_engine.engine.target.device)
+            # print(i, verify_prob.shape, speculation_prob.shape)
+            # print(verify_prob[i], speculation_prob[i])
+            if r < torch.min(torch.tensor([1], device=r.device), (verify_prob[i] / speculation_prob[i])):
+                count += 1
+                accepted_count += 1
+                n += 1
+                if verbose:
+                    spec_stream(i, tokenizer, 'green')
+                # if eos
+                if tokenizer.eos_token_id == i:
+                    draft_count -= gamma - count
+                    break
+            else:
+                spec_engine.engine.draft_cache.print_status()
+                spec_engine.engine.target_cache.print_status()
+                resample_count += 1
+                n += 1
+                pred_token_idx = sample(max_fn(verify_prob-speculation_prob))
+                if verbose:
+                    spec_stream(pred_token_idx, tokenizer, 'red')
+                break
+
+            if tokenizer.eos_token_id == pred_token_idx:
+                break
+        
+        spec_engine.engine.target_cache.seq_len -= (gamma - count)
+        spec_engine.engine.draft_cache.seq_len -= max(0,(gamma - count - 1))
+        
+        # spec_engine.quantize_and_pack()
+
+
+        if count == gamma:
+            n += 1
+            pred_token_idx = sample(verify_probs[-1])
+            spec_engine.draft_inference(input_ids=pred_token_idx.unsqueeze(0))
+            if verbose:
+                spec_stream(pred_token_idx, tokenizer, 'blue')
+            count -= 1
+        
+
+        next_token = pred_token_idx
+        spec_engine.engine.draft_cache.print_status()
+        spec_engine.engine.target_cache.print_status()
+
     time2 = time.time()
-    return n / (time2 - time1)
+    acceptance_rate = accepted_count / draft_count
+    avg_tokens = accepted_count / draft_count * gamma
+    if verbose:
+        print(f"Use {time2 - time1} sec to generate {n} tokens (now {spec_engine.engine.target_cache.seq_len} tokens), Tokens/s: {n / (time2 - time1)}", flush=True)
+        print(f"accepted rate {acceptance_rate}, avg generated tokens {avg_tokens}")
+
+    # if file_path is not None:
+    #     header = "target,acceptance_rate,token/s,avg_tokens,prefill,gen_len,dataset,acc_rate_middle,latency\n"
+    #     entry = f"{spec_engine.engine.model.config._name_or_path},{acceptance_rate},{n / (time2 - time1)},{avg_tokens},{input_ids.shape[1]},{n},{dataset},{np.array(acc_rate_middle_list).mean()},{(time2 - time1)/n}\n"
+
+        # if spec_args is not None:
+        #     for k, v in spec_args.items():
+        #         header=header.replace("\n", f",{k}\n")
+        #         entry=entry.replace("\n", f",{v}\n")
+        # log_csv(file_path, header, entry)
+    raise ValueError('stop')
+
+    return acceptance_rate, n / (time2 - time1)
+        
+
 
 
 @torch.inference_mode()
@@ -75,190 +164,190 @@ def Autoregressive(tokenizer, graph_engine, input_ids, max_len=256, top_k=-1, to
     return n / (time2 - time1)
 
 
-@torch.inference_mode()
-def TriForce(tokenizer, graph_engine, input_ids, gamma=4, max_len=256, top_k=-1, top_p=0.9, temperature=0.6, verbose=False, file_path=None, dataset=None, spec_args=None):
+# @torch.inference_mode()
+# def TriForce(tokenizer, graph_engine, input_ids, gamma=4, max_len=256, top_k=-1, top_p=0.9, temperature=0.6, verbose=False, file_path=None, dataset=None, spec_args=None):
 
-    # reset all cache
-    graph_engine.engine.kv_cache.reset()
-    graph_engine.engine.graph_cache.reset()
-    graph_engine.engine.draft_cache.reset()
+#     # reset all cache
+#     graph_engine.engine.kv_cache.reset()
+#     graph_engine.engine.graph_cache.reset()
+#     graph_engine.engine.draft_cache.reset()
 
-    logits = graph_engine.inference(input_ids=input_ids[:,:-1])
-    logits = graph_engine.inference(input_ids=input_ids[:,-1:])
-    _ = graph_engine.graph_draft_prefill(input_ids=input_ids)
+#     logits = graph_engine.inference(input_ids=input_ids[:,:-1])
+#     logits = graph_engine.inference(input_ids=input_ids[:,-1:])
+#     _ = graph_engine.graph_draft_prefill(input_ids=input_ids)
 
-    if verbose:
-        graph_engine.engine.kv_cache.print_status()
-        graph_engine.engine.graph_cache.print_status()
-        graph_engine.engine.draft_cache.print_status()
+#     if verbose:
+#         graph_engine.engine.kv_cache.print_status()
+#         graph_engine.engine.graph_cache.print_status()
+#         graph_engine.engine.draft_cache.print_status()
 
-    resample_count = 0
-    accepted_count = 0
-    target_sample_count = 0
-    draft_count = 0
+#     resample_count = 0
+#     accepted_count = 0
+#     target_sample_count = 0
+#     draft_count = 0
 
-    next_token = sample(norm_logits(logits[:,-1,:], temperature=temperature ,top_k=top_k, top_p=top_p))
+#     next_token = sample(norm_logits(logits[:,-1,:], temperature=temperature ,top_k=top_k, top_p=top_p))
     
-    if verbose:
-        spec_stream(next_token[0], tokenizer, 'cyan')
+#     if verbose:
+#         spec_stream(next_token[0], tokenizer, 'cyan')
 
-    acc_rate_middle_list = []
-    n = 0
-    time1 = time.time()
-    while n < max_len:
-        if next_token.shape == torch.Size([1]):
-            next_token = next_token.unsqueeze(0)
+#     acc_rate_middle_list = []
+#     n = 0
+#     time1 = time.time()
+#     while n < max_len:
+#         if next_token.shape == torch.Size([1]):
+#             next_token = next_token.unsqueeze(0)
         
-        # speculative decoding for draft (68m) and retrieval 7b model
-        pred_token_idx = next_token
-        verify_tokens, speculation_probs, acc_rate_middle = Middle_Spec(pred_token_idx, graph_engine, gamma, False, tokenizer)
-        acc_rate_middle_list.append(acc_rate_middle)
-        generated_ids = verify_tokens[1:]
-        draft_count += len(speculation_probs)
+#         # speculative decoding for draft (68m) and retrieval 7b model
+#         pred_token_idx = next_token
+#         verify_tokens, speculation_probs, acc_rate_middle = Middle_Spec(pred_token_idx, graph_engine, gamma, False, tokenizer)
+#         acc_rate_middle_list.append(acc_rate_middle)
+#         generated_ids = verify_tokens[1:]
+#         draft_count += len(speculation_probs)
 
-        gamma2 = len(generated_ids)
+#         gamma2 = len(generated_ids)
         
-        # speculative decoding retrieval 7b model and target model
-        verify_tokens = torch.cat([next_token, torch.LongTensor([generated_ids]).to(graph_engine.engine.model.device)], dim=1)
-        logits = graph_engine.inference(input_ids=verify_tokens)
+#         # speculative decoding retrieval 7b model and target model
+#         verify_tokens = torch.cat([next_token, torch.LongTensor([generated_ids]).to(graph_engine.engine.model.device)], dim=1)
+#         logits = graph_engine.inference(input_ids=verify_tokens)
 
-        count = 0
-        verify_probs = []
+#         count = 0
+#         verify_probs = []
     
-        probs = norm_logits(logits[0], temperature=temperature ,top_k=top_k, top_p=top_p)
-        for i in range(gamma2 + 1):
-            verify_probs.append(probs[i])
+#         probs = norm_logits(logits[0], temperature=temperature ,top_k=top_k, top_p=top_p)
+#         for i in range(gamma2 + 1):
+#             verify_probs.append(probs[i])
 
-        pass_tokens = torch.full((1, gamma2 + 2), 100, device=graph_engine.engine.model.device)
-        pass_tokens[:, 0] = next_token
+#         pass_tokens = torch.full((1, gamma2 + 2), 100, device=graph_engine.engine.model.device)
+#         pass_tokens[:, 0] = next_token
         
-        for i, speculation_prob, verify_prob in zip(generated_ids, speculation_probs, verify_probs):
-            r = torch.rand(1, device = graph_engine.engine.model.device)
-            if r < torch.min(torch.tensor([1], device=r.device), (verify_prob[i] / speculation_prob[i])):
-                count += 1
-                accepted_count += 1
-                n += 1
-                pred_token_idx = torch.tensor([[i]]).to(graph_engine.engine.model.device)
-                pass_tokens[:, count] = pred_token_idx
-                if verbose:
-                    spec_stream(i, tokenizer, 'green')
-                # if eos
-                if tokenizer.eos_token_id == i:
-                    draft_count -= gamma2 - count
-                    break
-            else:
-                resample_count += 1
-                n += 1
-                pred_token_idx = sample(max_fn(verify_prob-speculation_prob))
-                pass_tokens[:, count+1] = pred_token_idx
-                if verbose:
-                    spec_stream(pred_token_idx, tokenizer, 'red')
-                break
+#         for i, speculation_prob, verify_prob in zip(generated_ids, speculation_probs, verify_probs):
+#             r = torch.rand(1, device = graph_engine.engine.model.device)
+#             if r < torch.min(torch.tensor([1], device=r.device), (verify_prob[i] / speculation_prob[i])):
+#                 count += 1
+#                 accepted_count += 1
+#                 n += 1
+#                 pred_token_idx = torch.tensor([[i]]).to(graph_engine.engine.model.device)
+#                 pass_tokens[:, count] = pred_token_idx
+#                 if verbose:
+#                     spec_stream(i, tokenizer, 'green')
+#                 # if eos
+#                 if tokenizer.eos_token_id == i:
+#                     draft_count -= gamma2 - count
+#                     break
+#             else:
+#                 resample_count += 1
+#                 n += 1
+#                 pred_token_idx = sample(max_fn(verify_prob-speculation_prob))
+#                 pass_tokens[:, count+1] = pred_token_idx
+#                 if verbose:
+#                     spec_stream(pred_token_idx, tokenizer, 'red')
+#                 break
 
-            if tokenizer.eos_token_id == pred_token_idx:
-                break
+#             if tokenizer.eos_token_id == pred_token_idx:
+#                 break
 
-        # update 7b cache
-        graph_engine.engine.kv_cache.seq_len -= (len(generated_ids) - count)
-        graph_engine.update_graph_cache()
+#         # update 7b cache
+#         graph_engine.engine.kv_cache.seq_len -= (len(generated_ids) - count)
+#         graph_engine.update_graph_cache()
         
-        if count == len(generated_ids):
-            target_sample_count += 1
-            n += 1
-            pred_token_idx = sample(verify_probs[-1])
-            pass_tokens[:, count+1] = pred_token_idx
-            if verbose:
-                spec_stream(pred_token_idx, tokenizer, 'blue')
-            count += 1
+#         if count == len(generated_ids):
+#             target_sample_count += 1
+#             n += 1
+#             pred_token_idx = sample(verify_probs[-1])
+#             pass_tokens[:, count+1] = pred_token_idx
+#             if verbose:
+#                 spec_stream(pred_token_idx, tokenizer, 'blue')
+#             count += 1
 
-        # update cache for 68m
-        graph_engine.graph_draft_inference(input_ids=pass_tokens, gamma_offset = gamma2 + 1)
-        current_seq_len = graph_engine.engine.draft_cache.start_size + graph_engine.engine.draft_cache.recent_size + count
-        graph_engine.engine.draft_cache.evict_for_spec(current_seq_len)
+#         # update cache for 68m
+#         graph_engine.graph_draft_inference(input_ids=pass_tokens, gamma_offset = gamma2 + 1)
+#         current_seq_len = graph_engine.engine.draft_cache.start_size + graph_engine.engine.draft_cache.recent_size + count
+#         graph_engine.engine.draft_cache.evict_for_spec(current_seq_len)
 
-        next_token = pred_token_idx
+#         next_token = pred_token_idx
 
-    time2 = time.time()
-    acceptance_rate = accepted_count / draft_count
-    avg_tokens = accepted_count / draft_count * gamma
-    if verbose:
-        print(f"Use {time2 - time1} sec to generate {n} tokens (now {graph_engine.engine.kv_cache.seq_len} tokens), Tokens/s: {n / (time2 - time1)}", flush=True)
-        print(f"accepted rate {acceptance_rate}, avg generated tokens {avg_tokens}")
+#     time2 = time.time()
+#     acceptance_rate = accepted_count / draft_count
+#     avg_tokens = accepted_count / draft_count * gamma
+#     if verbose:
+#         print(f"Use {time2 - time1} sec to generate {n} tokens (now {graph_engine.engine.kv_cache.seq_len} tokens), Tokens/s: {n / (time2 - time1)}", flush=True)
+#         print(f"accepted rate {acceptance_rate}, avg generated tokens {avg_tokens}")
 
-    if file_path is not None:
-        header = "target,acceptance_rate,token/s,avg_tokens,prefill,gen_len,dataset,acc_rate_middle,latency\n"
-        entry = f"{graph_engine.engine.model.config._name_or_path},{acceptance_rate},{n / (time2 - time1)},{avg_tokens},{input_ids.shape[1]},{n},{dataset},{np.array(acc_rate_middle_list).mean()},{(time2 - time1)/n}\n"
+#     if file_path is not None:
+#         header = "target,acceptance_rate,token/s,avg_tokens,prefill,gen_len,dataset,acc_rate_middle,latency\n"
+#         entry = f"{graph_engine.engine.model.config._name_or_path},{acceptance_rate},{n / (time2 - time1)},{avg_tokens},{input_ids.shape[1]},{n},{dataset},{np.array(acc_rate_middle_list).mean()},{(time2 - time1)/n}\n"
 
-        if spec_args is not None:
-            for k, v in spec_args.items():
-                header=header.replace("\n", f",{k}\n")
-                entry=entry.replace("\n", f",{v}\n")
-        log_csv(file_path, header, entry)
+#         if spec_args is not None:
+#             for k, v in spec_args.items():
+#                 header=header.replace("\n", f",{k}\n")
+#                 entry=entry.replace("\n", f",{v}\n")
+#         log_csv(file_path, header, entry)
 
-    return acceptance_rate, n / (time2 - time1)
+#     return acceptance_rate, n / (time2 - time1)
 
-@torch.inference_mode()
-def Middle_Spec(next_token, graph_engine, gamma, verbose, tokenizer):
+# @torch.inference_mode()
+# def Middle_Spec(next_token, graph_engine, gamma, verbose, tokenizer):
 
-    n = 0
-    resample_count = 0
-    accepted_count = 0
-    target_sample_count = 0
-    draft_count = 0
+#     n = 0
+#     resample_count = 0
+#     accepted_count = 0
+#     target_sample_count = 0
+#     draft_count = 0
 
-    pred_token_idx = next_token
+#     pred_token_idx = next_token
 
-    return_generated_ids = []
-    return_speculation_probs = []
-    return_generated_ids.append(next_token.item())
+#     return_generated_ids = []
+#     return_speculation_probs = []
+#     return_generated_ids.append(next_token.item())
 
-    verify_tokens = torch.full((1, gamma + 1), 100, device=graph_engine.engine.model.device)
-    verify_tokens[:, 0] = next_token
+#     verify_tokens = torch.full((1, gamma + 1), 100, device=graph_engine.engine.model.device)
+#     verify_tokens[:, 0] = next_token
 
-    position_ids = torch.arange(graph_engine.engine.kv_cache.seq_len, graph_engine.engine.kv_cache.seq_len+gamma+1, device=graph_engine.engine.model.device).unsqueeze(0)
+#     position_ids = torch.arange(graph_engine.engine.kv_cache.seq_len, graph_engine.engine.kv_cache.seq_len+gamma+1, device=graph_engine.engine.model.device).unsqueeze(0)
 
-    while n < gamma:
-        speculation_prob = graph_engine.graph_draft_inference(input_ids=verify_tokens[:,:n+1], gamma_offset = n)
+#     while n < gamma:
+#         speculation_prob = graph_engine.graph_draft_inference(input_ids=verify_tokens[:,:n+1], gamma_offset = n)
         
-        pred_token_idx = sample(speculation_prob)
-        token_idx = pred_token_idx.item()
-        draft_count += 1
+#         pred_token_idx = sample(speculation_prob)
+#         token_idx = pred_token_idx.item()
+#         draft_count += 1
 
-        verify_tokens[:, n+1:n+2] = pred_token_idx
-        verify_prob = graph_engine.graph_verify(input_ids=verify_tokens, position_ids=position_ids)
+#         verify_tokens[:, n+1:n+2] = pred_token_idx
+#         verify_prob = graph_engine.graph_verify(input_ids=verify_tokens, position_ids=position_ids)
 
-        r = torch.rand(1, device = graph_engine.engine.model.device)
-        if r < torch.min(torch.tensor([1], device=r.device), (verify_prob[n, token_idx] / speculation_prob[token_idx])):
-            return_speculation_probs.append(verify_prob[n])
-            return_generated_ids.append(token_idx)
-            if verbose:
-                spec_stream(pred_token_idx, tokenizer, 'green')
-            accepted_count += 1
-            n += 1
+#         r = torch.rand(1, device = graph_engine.engine.model.device)
+#         if r < torch.min(torch.tensor([1], device=r.device), (verify_prob[n, token_idx] / speculation_prob[token_idx])):
+#             return_speculation_probs.append(verify_prob[n])
+#             return_generated_ids.append(token_idx)
+#             if verbose:
+#                 spec_stream(pred_token_idx, tokenizer, 'green')
+#             accepted_count += 1
+#             n += 1
         
-            pred_token_idx = sample(verify_prob[n])
-            return_speculation_probs.append(verify_prob[n])
-            return_generated_ids.append(pred_token_idx.item())
-            if verbose:
-                spec_stream(pred_token_idx, tokenizer, 'blue')
-            target_sample_count += 1
-            n += 1
+#             pred_token_idx = sample(verify_prob[n])
+#             return_speculation_probs.append(verify_prob[n])
+#             return_generated_ids.append(pred_token_idx.item())
+#             if verbose:
+#                 spec_stream(pred_token_idx, tokenizer, 'blue')
+#             target_sample_count += 1
+#             n += 1
 
-            verify_tokens[:, n:n+1] = pred_token_idx
+#             verify_tokens[:, n:n+1] = pred_token_idx
         
-        else:
-            pred_token_idx = sample(verify_prob[n])
-            return_speculation_probs.append(verify_prob[n])
-            return_generated_ids.append(pred_token_idx.item())
-            if verbose:
-                spec_stream(pred_token_idx, tokenizer, 'red')
-            resample_count += 1
-            n += 1
+#         else:
+#             pred_token_idx = sample(verify_prob[n])
+#             return_speculation_probs.append(verify_prob[n])
+#             return_generated_ids.append(pred_token_idx.item())
+#             if verbose:
+#                 spec_stream(pred_token_idx, tokenizer, 'red')
+#             resample_count += 1
+#             n += 1
 
-            verify_tokens[:, n:n+1] = pred_token_idx
+#             verify_tokens[:, n:n+1] = pred_token_idx
     
-    acceptance_rate = accepted_count / draft_count
-    return return_generated_ids, return_speculation_probs, acceptance_rate
+#     acceptance_rate = accepted_count / draft_count
+#     return return_generated_ids, return_speculation_probs, acceptance_rate
 
 
 
