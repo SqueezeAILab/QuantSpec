@@ -201,13 +201,13 @@ class QCache(Cache):
         self.key_states_quant_trans = torch.zeros([self.layers, 1, self.num_heads, self.head_dim, self.max_budget//(32//self.k_bits)], dtype=torch.int32).to(model.device)
         self.key_scale_trans = torch.zeros([self.layers, 1, self.num_heads, self.head_dim, self.max_budget//self.group_size], dtype=dtype).to(model.device)
         self.key_mn_trans = torch.zeros([self.layers, 1, self.num_heads, self.head_dim, self.max_budget//self.group_size], dtype=dtype).to(model.device)
-        self.key_states_full = torch.zeros([self.layers, 1, self.num_heads, 2048, self.head_dim], dtype=dtype).to(model.device)
+        self.key_states_full = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim], dtype=dtype).to(model.device)
 
 
         self.value_states_quant = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim//(32//self.v_bits)], dtype=torch.int32).to(model.device)
         self.value_scale = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim//self.group_size], dtype=dtype).to(model.device)
         self.value_mn = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim//self.group_size], dtype=dtype).to(model.device)
-        self.value_states_full = torch.zeros([self.layers, 1, self.num_heads, 2048, self.head_dim], dtype=dtype).to(model.device)
+        self.value_states_full = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim], dtype=dtype).to(model.device)
 
     def print_status(self):
         print("[Full Cache] Cached:", self.seq_len, "| Quantized:", self.quant_key_len, self.quant_val_len, "| full_precision:", self.seq_len-self.quant_key_len, self.seq_len-self.quant_val_len)

@@ -14,14 +14,8 @@ from utils.sampling import sample, norm_logits, max_fn
 def SpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, top_k=-1, top_p=0.9, temperature=0.6, verbose=False, file_path=None, dataset=None, spec_args=None):
     spec_engine.clear_kv()
 
-    logits = spec_engine.inference(input_ids=input_ids[:,:-1])
-    logits = spec_engine.inference(input_ids=input_ids[:,-1:])
+    logits = spec_engine.inference(input_ids=input_ids)
     _ = spec_engine.draft_prefill(input_ids=input_ids)
-    # spec_engine.draft_cache.quantize_and_pack()
-
-    if verbose:
-        spec_engine.engine.target_cache.print_status()
-        spec_engine.engine.draft_cache.print_status()
 
     next_token = sample(norm_logits(logits[:,-1,:], temperature=temperature ,top_k=top_k, top_p=top_p))
     
@@ -42,36 +36,26 @@ def SpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, top_k=-1, 
         verify_tokens[:, 0] = next_token
         speculation_probs = []
         for i in range(gamma):
-            logits = spec_engine.draft_inference(input_ids=verify_tokens[:,i:i+1])
-            prob = norm_logits(logits[:,-1,:], temperature=temperature ,top_k=top_k, top_p=top_p).squeeze()
+            spec_engine.engine.draft_cache.seq_len -= i
+            logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,:i+1])
+            prob = norm_logits(logits_[:,-1,:], temperature=temperature ,top_k=top_k, top_p=top_p).squeeze()
             speculation_probs.append(prob)
             next_token = sample(prob)
             verify_tokens[:, i+1] = next_token.item()
             # draft_count += 1
         draft_count += gamma
-        # generated_ids = verify_tokens[1:]
-        # gamma2 = len(generated_ids)
+
         logits = spec_engine.inference(input_ids=verify_tokens)
-
-        count = 0
-
+        count = 0  
         verify_probs = []
-        # print('logits.shape', logits.shape)
         probs = norm_logits(logits[0], temperature=temperature ,top_k=top_k, top_p=top_p)
-
-        # print('probs.shape', probs.shape)
         for i in range(gamma + 1):
             verify_probs.append(probs[i])
 
-        for i in range(gamma):
-            print(f'verify_probs[{i}]: {verify_probs[i].max()}, {verify_probs[i].min()}')
-            print(f'speculation_probs[{i}]: {speculation_probs[i].max()}, {speculation_probs[i].min()}')
+        # print(speculation_probs[0].shape, verify_probs[0].shape)
         
-        # print('verify_probs', verify_probs[0].shape)
         for i, speculation_prob, verify_prob in zip(verify_tokens[0,1:], speculation_probs, verify_probs):
             r = torch.rand(1, device = spec_engine.engine.target.device)
-            # print(i, verify_prob.shape, speculation_prob.shape)
-            # print(verify_prob[i], speculation_prob[i])
             if r < torch.min(torch.tensor([1], device=r.device), (verify_prob[i] / speculation_prob[i])):
                 count += 1
                 accepted_count += 1
@@ -83,8 +67,6 @@ def SpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, top_k=-1, 
                     draft_count -= gamma - count
                     break
             else:
-                spec_engine.engine.draft_cache.print_status()
-                spec_engine.engine.target_cache.print_status()
                 resample_count += 1
                 n += 1
                 pred_token_idx = sample(max_fn(verify_prob-speculation_prob))
@@ -104,33 +86,19 @@ def SpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, top_k=-1, 
         if count == gamma:
             n += 1
             pred_token_idx = sample(verify_probs[-1])
-            spec_engine.draft_inference(input_ids=pred_token_idx.unsqueeze(0))
+            spec_engine.engine.draft_cache.seq_len -= gamma
+            spec_engine.draft_inference(input_ids=verify_tokens)
             if verbose:
                 spec_stream(pred_token_idx, tokenizer, 'blue')
-            count -= 1
-        
+            count += 1
 
         next_token = pred_token_idx
-        spec_engine.engine.draft_cache.print_status()
-        spec_engine.engine.target_cache.print_status()
-
     time2 = time.time()
     acceptance_rate = accepted_count / draft_count
     avg_tokens = accepted_count / draft_count * gamma
     if verbose:
         print(f"Use {time2 - time1} sec to generate {n} tokens (now {spec_engine.engine.target_cache.seq_len} tokens), Tokens/s: {n / (time2 - time1)}", flush=True)
         print(f"accepted rate {acceptance_rate}, avg generated tokens {avg_tokens}")
-
-    # if file_path is not None:
-    #     header = "target,acceptance_rate,token/s,avg_tokens,prefill,gen_len,dataset,acc_rate_middle,latency\n"
-    #     entry = f"{spec_engine.engine.model.config._name_or_path},{acceptance_rate},{n / (time2 - time1)},{avg_tokens},{input_ids.shape[1]},{n},{dataset},{np.array(acc_rate_middle_list).mean()},{(time2 - time1)/n}\n"
-
-        # if spec_args is not None:
-        #     for k, v in spec_args.items():
-        #         header=header.replace("\n", f",{k}\n")
-        #         entry=entry.replace("\n", f",{v}\n")
-        # log_csv(file_path, header, entry)
-    raise ValueError('stop')
 
     return acceptance_rate, n / (time2 - time1)
         

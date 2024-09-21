@@ -10,15 +10,14 @@ from transformers import AutoTokenizer
 from termcolor import colored
 from tqdm import tqdm
 from data.dataset import get_dataset
-from models.modeling_llama import LlamaForCausalLM
+from models.modeling_llama import LlamaForCausalLM_KIVI as LlamaForCausalLM_KIVI2
 from models.modeling_llama_68m import LlamaForCausalLM as LlamaForCausalLM_68M
 from models.cache import FlashSimpleCache, QCache, StreamingLLMEvictionCache, RetrievalCache
 from utils.decoding import SpecDecode
 from utils.misc import print_config
 from utils.graph_infer import GraphInferenceEngine
-from transformers import LlamaConfig, AutoTokenizer
+from transformers import AutoTokenizer, LlamaConfig
 from models.modelling_llama_kivi  import LlamaForCausalLM_KIVI
-from models.modelling_llama_simquant import LlamaForCausalLM_SIMQUANT
 
 import argparse
 def parse_arguments():
@@ -66,14 +65,14 @@ if __name__ == "__main__":
         pretrained_model_name_or_path='JackFram/llama-68m',
         config=config,
         cache_dir=CACHE_DIR,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         device_map="cuda:0"
         )
         target = LlamaForCausalLM_KIVI.from_pretrained(
         pretrained_model_name_or_path='JackFram/llama-68m',
         config=config,
         cache_dir=CACHE_DIR,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         device_map="cuda:0"
         )
     else:
@@ -85,8 +84,8 @@ if __name__ == "__main__":
     # tokenizer = AutoTokenizer.from_pretrained("NousResearch/Yarn-Llama-2-7b-128k", cache_dir=args.cache_dir, use_fast=True, legacy=False)
     tokenizer = AutoTokenizer.from_pretrained(
     'JackFram/llama-68m', 
-    use_fast=False, 
-    trust_remote_code=True, 
+    use_fast=True, 
+    legacy=False,
     tokenizer_type='llama')
     tokenized_prompts = get_dataset(dataset_name=args.dataset, tokenizer=tokenizer, datalen=args.prefill)
 
