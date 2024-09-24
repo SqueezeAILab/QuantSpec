@@ -1,0 +1,1 @@
+python test/on_chip.py --prefill 1024 --quantized_draft --verbose --gamma 16 --cache_dir /rscratch/xihc/.cache/

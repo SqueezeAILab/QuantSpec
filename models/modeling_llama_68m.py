@@ -21,6 +21,8 @@ from flash_attn import flash_attn_with_kvcache
 from .config_yarn import LlamaConfig
 from models.cache import Cache
 
+# ------------ Currently not used --------------
+
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]

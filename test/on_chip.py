@@ -10,9 +10,9 @@ from transformers import AutoTokenizer
 from termcolor import colored
 from tqdm import tqdm
 from data.dataset import get_dataset
-from models.modeling_llama import LlamaForCausalLM_KIVI as LlamaForCausalLM_KIVI2
+# from models.modeling_llama import LlamaForCausalLM_KIVI as LlamaForCausalLM_KIVI2
 from models.modelling_llama_simquant import LlamaForCausalLM_Simquant
-from models.modeling_llama_68m import LlamaForCausalLM as LlamaForCausalLM_68M
+# from models.modeling_llama_68m import LlamaForCausalLM as LlamaForCausalLM_68M
 from models.cache import SimUniformDynamicCache
 from utils.decoding import SpecDecode, SimQuantSpecDecode
 from utils.misc import print_config

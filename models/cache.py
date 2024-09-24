@@ -1,7 +1,7 @@
 from typing import Any, Dict, List, Optional, Tuple
 from numpy import dtype
 import torch
-from quant.new_pack import triton_quantize_and_pack_along_last_dim
+from quant_kivi.new_pack import triton_quantize_and_pack_along_last_dim
 
 import math
 
@@ -161,7 +161,7 @@ class SimUniformDynamicCache(Cache):
         minval = torch.min(inp, dim=q_channel).values
         # print('inp', inp.shape)
 
-        rangeval = (maxval - minval) / 2
+        rangeval = (maxval - minval)
         qx = (2**bits - 1) / rangeval
         offset = minval * qx
         offset = offset.unsqueeze(q_channel)
@@ -176,6 +176,8 @@ class SimUniformDynamicCache(Cache):
 
 class SimquantCache(Cache):
     def __init__(self, model, quantizers, max_budget=1024) -> None:
+        raise ValueError("Not being used now. Use SimUniformDynamicCache instead.")
+
         self.seq_len = 0
         self.quant_key_len = 0
         self.quant_val_len = 0
@@ -266,6 +268,8 @@ class SimquantCache(Cache):
                 
 class QCache(Cache):
     def __init__(self, model, max_budget=1024) -> None:
+        raise ValueError("Not being used now. Use SimUniformDynamicCache instead.")
+
         self.seq_len = 0
         self.quant_key_len = 0
         self.quant_val_len = 0
@@ -381,6 +385,8 @@ class QCache(Cache):
 ############## Single GPU Cache ###############
 class FlashSimpleCache(Cache):
     def __init__(self, model, max_budget=1024) -> None:
+        raise ValueError("Not being used now. Use SimUniformDynamicCache instead.")
+
         self.seq_len = 0
         self.max_budget = max_budget
 
