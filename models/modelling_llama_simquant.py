@@ -93,9 +93,6 @@ class LlamaAttention_Simquant(nn.Module):
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
             )
         bsz, q_len, _ = hidden_states.size()
-        if torch.isinf(hidden_states).any():
-            print(f"Layer {self.layer_idx} has NaN values in hidden_states") 
-            raise ValueError(f"Layer {self.layer_idx} has NaN values in hidden_states")
 
         if self.config.pretraining_tp > 1:
             key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
@@ -135,27 +132,13 @@ class LlamaAttention_Simquant(nn.Module):
         # [bsz, nh, t, hd]
         # if kv_cache is not None:
         past_key_value = kv_cache.update(key_states, value_states, layer_idx=self.layer_idx)
-        key_states_quant = past_key_value[0]
-        key_states_full = past_key_value[1]
-        value_states_quant = past_key_value[4]
-        value_states_full = past_key_value[5]
+        key_states_full = past_key_value[0]
+        value_states_full = past_key_value[1]
 
-        if key_states_quant is not None:
-            att_qkquant = torch.matmul(query_states, key_states_quant.transpose(2, 3))
-            # att_qkquant = cuda_bmm_fA_qB_outer(self.group_size, query_states, key_states_quant_trans, 
-            #                 key_scale_trans, key_mn_trans, self.k_bits)
-        else:
-            att_qkquant = None
-
-        # if key_states_full is not None:
-        #     key_states_full = torch.cat([key_states_full, key_states], dim=2)
-        # else:
-        #     key_states_full = key_states
+        # print(f"key_states_full: {key_states_full.shape}")
+        # print(f"value_states_full: {value_states_full.shape}")
         att_qkfull = torch.matmul(query_states, key_states_full.transpose(2, 3))
-        if att_qkquant is not None:
-            attn_weights = torch.cat([att_qkquant, att_qkfull], dim=-1) / math.sqrt(self.head_dim)
-        else:
-            attn_weights = att_qkfull / math.sqrt(self.head_dim)
+        attn_weights = att_qkfull / math.sqrt(self.head_dim)
         
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -175,15 +158,7 @@ class LlamaAttention_Simquant(nn.Module):
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        value_full_length = value_states_full.shape[-2]
-        if value_states_quant is None:
-            attn_output = torch.matmul(attn_weights, value_states_full)
-        else:
-            # attn_output = cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, :-value_full_length], value_states_quant, 
-            #                                 value_scale, value_mn, self.v_bits)
-            attn_output = torch.matmul(attn_weights[:, :, :, :-value_full_length], value_states_quant)
-            attn_output += torch.matmul(attn_weights[:, :, :, -value_full_length:], value_states_full)
-            
+        attn_output = torch.matmul(attn_weights, value_states_full)
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
@@ -218,6 +193,7 @@ class LlamaFlashAttention_Simquant(LlamaAttention_Simquant):
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
             )
         bsz, q_len, _ = hidden_states.size()
+        raise 'Not Implemented yet'
 
         if self.config.pretraining_tp > 1:
             key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
@@ -549,10 +525,6 @@ class LlamaDecoderLayer_Simquant(nn.Module):
 
         hidden_states = self.input_layernorm(hidden_states)
 
-        if torch.isinf(hidden_states).any():
-            print(f"Layer has NaN values in hidden_states") 
-            raise ValueError(f"Layer has NaN values in hidden_states")
-
         # Self Attention
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
@@ -568,27 +540,11 @@ class LlamaDecoderLayer_Simquant(nn.Module):
 
         # Fully Connected
         residual = hidden_states
-        if torch.isinf(hidden_states).any():
-            print(f"Layer has NaN values in hidden_states") 
-            raise ValueError(f"Layer has NaN values in hidden_states")
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if torch.isinf(hidden_states).any():
-            print(f"Layer has NaN values in hidden_states") 
-            raise ValueError(f"Layer has NaN values in hidden_states")
-        print(f"hidden_states after post_attention_layernorm: {hidden_states.max(), hidden_states.dtype, hidden_states.min()}")
         hidden_states = self.mlp(hidden_states)
         
                 # Print MLP parameters max and min
-        print(f"MLP gate_proj weight: max={self.mlp.gate_proj.weight.max().item():.4f}, min={self.mlp.gate_proj.weight.min().item():.4f}")
-        print(f"MLP up_proj weight: max={self.mlp.up_proj.weight.max().item():.4f}, min={self.mlp.up_proj.weight.min().item():.4f}")
-        print(f"MLP down_proj weight: max={self.mlp.down_proj.weight.max().item():.4f}, min={self.mlp.down_proj.weight.min().item():.4f}")
-        if torch.isinf(hidden_states).any():
-            print(f"Layer has NaN values in hidden_states") 
-            raise ValueError(f"Layer has NaN values in hidden_states")
         hidden_states = residual + hidden_states
-        if torch.isinf(hidden_states).any():
-            print(f"Layer has NaN values in hidden_states") 
-            raise ValueError(f"Layer has NaN values in hidden_states")
         outputs = (hidden_states,)
 
         # if output_attentions:
@@ -712,9 +668,6 @@ class LlamaModel_Simquant(LlamaPreTrainedModel):
                     use_cache,
                 )
             else:
-                if torch.isinf(hidden_states).any():
-                    print(f"Layer {idx} has NaN values in hidden_states model") 
-                    raise ValueError(f"Layer {idx} has NaN values in hidden_states model")
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=attention_mask,
@@ -725,10 +678,6 @@ class LlamaModel_Simquant(LlamaPreTrainedModel):
                 )
 
             hidden_states = layer_outputs[0]
-            if torch.isinf(hidden_states).any():
-                print(f"Layer {idx} has NaN values in hidden_states model") 
-                raise ValueError(f"Layer {idx} has NaN values in hidden_states model")
-
             # if use_cache:
             #     next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 

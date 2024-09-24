@@ -90,6 +90,90 @@ def quant_fn_nuq_recon(
 
     return qinp_out.float()
 
+
+class SimUniformDynamicCache(Cache):
+    def __init__(self, model, max_budget=1024) -> None:
+        self.seq_len = 0
+        self.quant_key_len = 0
+        self.quant_val_len = 0
+        self.residual_length = model.config.residual_length
+        # self.num_key_value_heads = model.config.num_key_value_heads
+        self.group_size = model.config.group_size
+        self.k_bits = model.config.k_bits
+        self.v_bits = model.config.v_bits
+        self.max_budget = max_budget
+
+        self.hidden_size = model.config.hidden_size
+        self.num_heads = model.config.num_key_value_heads
+        self.head_dim = self.hidden_size // model.config.num_attention_heads
+        self.layers = model.config.num_hidden_layers
+
+        dtype = model.model.layers[0].self_attn.q_proj.weight.dtype
+        self.key_states = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim], dtype=dtype).to(model.device)
+        self.value_states = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim], dtype=dtype).to(model.device)
+
+    def print_status(self):
+        print("[Full Cache] Cached:", self.seq_len, "| Quantized:", self.quant_key_len, self.quant_val_len, "| full_precision:", self.seq_len-self.quant_key_len, self.seq_len-self.quant_val_len)
+    
+    def reset(self):
+        self.seq_len = 0
+        self.quant_key_len = 0
+        self.quant_val_len = 0
+        self.key_states.zero_()
+        self.value_states.zero_()
+    
+    def update(self, key_states, value_states, layer_idx):
+        self.key_states[layer_idx][:, :, self.seq_len : self.seq_len + key_states.shape[-2]] = key_states
+        self.value_states[layer_idx][:, :, self.seq_len : self.seq_len + value_states.shape[-2]] = value_states
+
+        output = (
+            self.key_states[layer_idx][:,:, :self.seq_len+key_states.shape[-2]], 
+            self.value_states[layer_idx][:,:, :self.seq_len+value_states.shape[-2]], 
+            )
+        if layer_idx == self.layers-1:
+            self.seq_len += key_states.size(2)
+        return output
+    
+    def quantize_and_pack(self):
+        full_key_len = self.seq_len - self.quant_key_len
+        if full_key_len > self.residual_length:
+            assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
+            to_quant_len = full_key_len-(full_key_len%self.residual_length)
+            for layer_idx in range(self.layers):
+                for i in range(self.quant_key_len, self.quant_key_len+to_quant_len, self.group_size):
+                    self.key_states[layer_idx][:, :, i:i+self.group_size] = self.simquant(
+                        self.key_states[layer_idx][:, :, i:i+self.group_size].clone(), self.k_bits, q_channel=-2)
+            self.quant_key_len += to_quant_len
+            
+        full_val_len = self.seq_len - self.quant_val_len
+        if full_val_len > self.residual_length:
+            assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
+            to_quant_len = full_val_len-self.residual_length
+            for layer_idx in range(self.layers):
+                for i in range(0, self.head_dim, self.group_size):
+                    self.value_states[layer_idx][:, :, self.quant_val_len:self.quant_val_len+to_quant_len,i:i+self.group_size] = self.simquant(
+                        self.value_states[layer_idx][:, :, self.quant_val_len:self.quant_val_len+to_quant_len,i:i+self.group_size].clone(), self.v_bits, q_channel=-1)
+            self.quant_val_len += to_quant_len
+        
+    
+    def simquant(self, inp, bits, q_channel=-1):
+        maxval = torch.max(inp, dim=q_channel).values
+        minval = torch.min(inp, dim=q_channel).values
+        # print('inp', inp.shape)
+
+        rangeval = (maxval - minval) / 2
+        qx = (2**bits - 1) / rangeval
+        offset = minval * qx
+        offset = offset.unsqueeze(q_channel)
+        qx = qx.unsqueeze(q_channel)
+        # print('qx', qx.shape)
+        # print('offset', offset.shape)
+        qinp = torch.round(qx * inp - offset)
+        qinp = torch.clip(qinp, min=0, max=2**bits - 1)
+        qinp_out = (qinp + offset) / qx
+        qinp_out = torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0)
+        return qinp_out
+
 class SimquantCache(Cache):
     def __init__(self, model, quantizers, max_budget=1024) -> None:
         self.seq_len = 0
