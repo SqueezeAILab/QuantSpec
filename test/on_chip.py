@@ -15,7 +15,7 @@ from models.modelling_llama_simquant import LlamaForCausalLM_Simquant
 # from models.modeling_llama_68m import LlamaForCausalLM as LlamaForCausalLM_68M
 from models.cache import SimUniformDynamicCache
 from utils.decoding import SpecDecode, SimQuantSpecDecode
-from utils.misc import print_config
+from utils.misc import print_config, log_csv
 from utils.graph_infer import GraphInferenceEngine
 from transformers import AutoTokenizer, LlamaConfig
 from models.modelling_llama_kivi  import LlamaForCausalLM_KIVI
@@ -96,8 +96,8 @@ if __name__ == "__main__":
     verbose = args.verbose
     # chunk_size = args.chunk_size
     # max_budget = args.budget
-
-    # print_config(draft, None, prefill, gen_len, gamma, top_k, top_p, temperature, file_path=None, method="TriForce", spec_args={'budget': args.budget, 'chunk_size': chunk_size}, dataset=args.dataset)
+    log_file = "on_chip_results.txt"
+    print_config(draft, target, args.dataset, prefill, gen_len, gamma, top_k, top_p, temperature, args.quantized_draft, args.k_bits, args.v_bits, args.group_size, args.residual_length)
 
     ####### cache init #######
 
@@ -114,15 +114,21 @@ if __name__ == "__main__":
 
     decoding_fn = SimQuantSpecDecode if args.quantized_draft else SpecDecode
 
+    log_file = "on_chip_results.txt"
+    log_csv(log_file, "acceptance_rate, speed\n", "testing")
+
+
+
+
     ######## Warm up for our method ########
-    n_warmups = 3
+    n_warmups = 1
     input_ids = tokenized_prompts[0].to(target.device)[:,:prefill]
-    for i in tqdm(range(n_warmups), desc="TriForce Warmup"):
+    for i in tqdm(range(n_warmups), desc="SpecDecode Warmup"):
         decoding_fn(tokenizer, spec_engine, input_ids, gamma=gamma, max_len=gen_len, top_k=top_k, top_p=top_p, temperature=temperature, verbose=verbose, file_path=None, dataset=args.dataset)
 
     all_acceptance_rate = []
     all_speed = []
-    for input_ids in tqdm(tokenized_prompts, desc="TriForce Test"):
+    for input_ids in tqdm(tokenized_prompts[:4], desc="SpecDecode Test"):
         input_ids = input_ids.to(target.device)[:,:prefill]
 
         acceptance_rate, speed = decoding_fn(tokenizer, spec_engine, input_ids, gamma=gamma, max_len=gen_len, top_k=top_k, top_p=top_p, temperature=temperature, verbose=verbose, file_path=None, dataset=args.dataset)
@@ -132,3 +138,5 @@ if __name__ == "__main__":
     method_latency = 1000/(sum(all_speed) / len(all_speed))
     print(colored(f"average acceptance rate (NOT per token): {sum(all_acceptance_rate) / len(all_acceptance_rate)}", "red"))
     print(colored(f"[SpecQuant] average latency: {method_latency} ms", "red"))
+    
+    log_csv(log_file, None, f"{sum(all_acceptance_rate) / len(all_acceptance_rate)}, {str(all_acceptance_rate)}, {method_latency}\n")
