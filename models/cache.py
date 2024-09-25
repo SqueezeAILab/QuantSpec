@@ -17,78 +17,78 @@ class Cache:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError("Make sure to implement `update` in a subclass.")
 
-def quant_fn_nuq_recon(
-    inp,
-    bits=8,
-    qchannel = -1,
-    outlier_mask=None,
-    maxval=-1,
-    minval=-1,
-    lut=None,
-):
+# def quant_fn_nuq_recon(
+#     inp,
+#     bits=8,
+#     qchannel = -1,
+#     outlier_mask=None,
+#     maxval=-1,
+#     minval=-1,
+#     lut=None,
+# ):
 
 
-    # set quantization threshold dynamically
-    if dynamicquantization:
-        if include_sparse:
-            outliers = inp * outlier_mask
-            median = torch.median(inp, dim=qchannel).values
-            median = median.unsqueeze(qchannel)
-            median_mask = median * outlier_mask
+#     # set quantization threshold dynamically
+#     if dynamicquantization:
+#         if include_sparse:
+#             outliers = inp * outlier_mask
+#             median = torch.median(inp, dim=qchannel).values
+#             median = median.unsqueeze(qchannel)
+#             median_mask = median * outlier_mask
 
-            # recenter using mean to avoid having outliers skew quant distribution
-            tmp_inp = inp - outliers + median_mask
-            maxval = torch.max(tmp_inp, dim=qchannel).values
-            minval = torch.min(tmp_inp, dim=qchannel).values
-        else:
-            maxval = torch.max(inp, dim=qchannel).values
-            minval = torch.min(inp, dim=qchannel).values
+#             # recenter using mean to avoid having outliers skew quant distribution
+#             tmp_inp = inp - outliers + median_mask
+#             maxval = torch.max(tmp_inp, dim=qchannel).values
+#             minval = torch.min(tmp_inp, dim=qchannel).values
+#         else:
+#             maxval = torch.max(inp, dim=qchannel).values
+#             minval = torch.min(inp, dim=qchannel).values
 
-    # compute offset here:
-    offset = (maxval + minval) / 2
-    rangeval = (maxval - minval) / 2
-    offset = offset.unsqueeze(qchannel)
-    rangeval = rangeval.unsqueeze(qchannel)
+#     # compute offset here:
+#     offset = (maxval + minval) / 2
+#     rangeval = (maxval - minval) / 2
+#     offset = offset.unsqueeze(qchannel)
+#     rangeval = rangeval.unsqueeze(qchannel)
 
-    # subtract offset
-    inp = inp - offset
+#     # subtract offset
+#     inp = inp - offset
 
-    # need to handle outlier removal here due to issues with zeroing out non-outliers
-    if include_sparse:
-        outliers = inp * outlier_mask
-        inp = inp - outliers
+#     # need to handle outlier removal here due to issues with zeroing out non-outliers
+#     if include_sparse:
+#         outliers = inp * outlier_mask
+#         inp = inp - outliers
 
-    #dividing by range to normalize to [-1,1]
-    inp_scaled = inp / rangeval
+#     #dividing by range to normalize to [-1,1]
+#     inp_scaled = inp / rangeval
 
-    # round to nearest LUT entry
-    lut_cuda = torch.tensor(lut[0]).to(inp_scaled.device)
-    Q = round_to_nearest_pole_sim(inp_scaled.flatten(), lut_cuda)
-    qinp_out = Q.reshape(inp.shape).float().to(inp_scaled.device)
+#     # round to nearest LUT entry
+#     lut_cuda = torch.tensor(lut[0]).to(inp_scaled.device)
+#     Q = round_to_nearest_pole_sim(inp_scaled.flatten(), lut_cuda)
+#     qinp_out = Q.reshape(inp.shape).float().to(inp_scaled.device)
 
-    if norm:
-        normscale = normscale.to(inp_scaled.device)
-        normoffset = normoffset.to(inp_scaled.device)
-        qinp_out = qinp_out*normscale + normoffset
+#     if norm:
+#         normscale = normscale.to(inp_scaled.device)
+#         normoffset = normoffset.to(inp_scaled.device)
+#         qinp_out = qinp_out*normscale + normoffset
 
-    # un-normalize
-    qinp_out = qinp_out * rangeval
+#     # un-normalize
+#     qinp_out = qinp_out * rangeval
 
-    # add outliers back
-    if include_sparse:
-        qinp_out[outlier_mask] = 0
-        qinp_out = qinp_out + outliers
+#     # add outliers back
+#     if include_sparse:
+#         qinp_out[outlier_mask] = 0
+#         qinp_out = qinp_out + outliers
 
-    #shift by offset
-    qinp_out = qinp_out + offset
-    qinp_out = torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0) #TODO: debug (shouldn't be necessary)
+#     #shift by offset
+#     qinp_out = qinp_out + offset
+#     qinp_out = torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0) #TODO: debug (shouldn't be necessary)
 
-    # leave first few in fp16
-    # leave this here for now -> avoids any small perturbations from rescaling
-    if first_few_fp16 > -1:
-        qinp_out[:first_few_fp16,:] = orig[:first_few_fp16,:]
+#     # leave first few in fp16
+#     # leave this here for now -> avoids any small perturbations from rescaling
+#     if first_few_fp16 > -1:
+#         qinp_out[:first_few_fp16,:] = orig[:first_few_fp16,:]
 
-    return qinp_out.float()
+#     return qinp_out.float()
 
 
 class SimUniformDynamicCache(Cache):
@@ -161,7 +161,7 @@ class SimUniformDynamicCache(Cache):
         minval = torch.min(inp, dim=q_channel).values
         # print('inp', inp.shape)
 
-        rangeval = (maxval - minval) / 2
+        rangeval = (maxval - minval) / 1.
         qx = (2**bits - 1) / rangeval
         offset = minval * qx
         offset = offset.unsqueeze(q_channel)
@@ -213,6 +213,16 @@ class SimquantCache(Cache):
         self.quant_val_len = 0
         self.key_states.zero_()
         self.value_states.zero_()
+    
+    def init_simquant(self, quantizers):
+        for i in range(self.layers):
+            self.outlier_threshold_upper_keys[i] = torch.tensor(quantizers['model.layers.{i}.self_attn.k_proj'][0]).to(self.device)
+            self.outlier_threshold_lower_keys[i] = torch.tensor(quantizers['model.layers.{i}.self_attn.k_proj'][1]).to(self.device)
+            self.lut_keys[i] = torch.tensor(quantizers['model.layers.{i}.self_attn.k_proj'][2][0]).to(self.device)
+
+            self.outlier_threshold_upper_values[i] = torch.tensor(quantizers['model.layers.{i}.self_attn.v_proj'][2][0]).to(self.device)
+            self.outlier_threshold_lower_values[i] = torch.tensor(quantizers['model.layers.{i}.self_attn.v_proj'][2][1]).to(self.device)
+            self.lut_values[i] = torch.tensor(quantizers['model.layers.{i}.self_attn.v_proj'][2][2]).to(self.device)
     
     def update(self, key_states, value_states, layer_idx):
         # print(key_states.shape, value_states.shape)
