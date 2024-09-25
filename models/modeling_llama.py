@@ -6,8 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from quant.new_pack import triton_quantize_and_pack_along_last_dim
-from quant.matmul import cuda_bmm_fA_qB_outer
+from quant_kivi.new_pack import triton_quantize_and_pack_along_last_dim
+from quant_kivi.matmul import cuda_bmm_fA_qB_outer
 
 from transformers.models.llama.configuration_llama import *
 from transformers.models.llama.modeling_llama import *
