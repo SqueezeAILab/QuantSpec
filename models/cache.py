@@ -5,6 +5,25 @@ from quant_kivi.new_pack import triton_quantize_and_pack_along_last_dim
 
 import math
 
+def round_to_nearest_pole_sim(w, poles):
+    """
+    w: weight/act values (1d vector)
+    poles: tuple of values
+
+    Round the numbers in w to the nearest value in poles.
+    """
+    stack = []
+    for c in poles:
+        diff = (w - c).abs()
+        stack.append(diff)
+    diff = torch.stack(stack)
+    idx = diff.argmin(axis=0)
+    aug = 0
+    for i, c in enumerate(poles):
+        aug += (idx == i) * c
+
+    return aug
+
 class Cache:
     """
     Base, abstract class for all caches. The actual data structure is specific to each subclass.
@@ -16,79 +35,6 @@ class Cache:
         layer_idx: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError("Make sure to implement `update` in a subclass.")
-
-# def quant_fn_nuq_recon(
-#     inp,
-#     bits=8,
-#     qchannel = -1,
-#     outlier_mask=None,
-#     maxval=-1,
-#     minval=-1,
-#     lut=None,
-# ):
-
-
-#     # set quantization threshold dynamically
-#     if dynamicquantization:
-#         if include_sparse:
-#             outliers = inp * outlier_mask
-#             median = torch.median(inp, dim=qchannel).values
-#             median = median.unsqueeze(qchannel)
-#             median_mask = median * outlier_mask
-
-#             # recenter using mean to avoid having outliers skew quant distribution
-#             tmp_inp = inp - outliers + median_mask
-#             maxval = torch.max(tmp_inp, dim=qchannel).values
-#             minval = torch.min(tmp_inp, dim=qchannel).values
-#         else:
-#             maxval = torch.max(inp, dim=qchannel).values
-#             minval = torch.min(inp, dim=qchannel).values
-
-#     # compute offset here:
-#     offset = (maxval + minval) / 2
-#     rangeval = (maxval - minval) / 2
-#     offset = offset.unsqueeze(qchannel)
-#     rangeval = rangeval.unsqueeze(qchannel)
-
-#     # subtract offset
-#     inp = inp - offset
-
-#     # need to handle outlier removal here due to issues with zeroing out non-outliers
-#     if include_sparse:
-#         outliers = inp * outlier_mask
-#         inp = inp - outliers
-
-#     #dividing by range to normalize to [-1,1]
-#     inp_scaled = inp / rangeval
-
-#     # round to nearest LUT entry
-#     lut_cuda = torch.tensor(lut[0]).to(inp_scaled.device)
-#     Q = round_to_nearest_pole_sim(inp_scaled.flatten(), lut_cuda)
-#     qinp_out = Q.reshape(inp.shape).float().to(inp_scaled.device)
-
-#     if norm:
-#         normscale = normscale.to(inp_scaled.device)
-#         normoffset = normoffset.to(inp_scaled.device)
-#         qinp_out = qinp_out*normscale + normoffset
-
-#     # un-normalize
-#     qinp_out = qinp_out * rangeval
-
-#     # add outliers back
-#     if include_sparse:
-#         qinp_out[outlier_mask] = 0
-#         qinp_out = qinp_out + outliers
-
-#     #shift by offset
-#     qinp_out = qinp_out + offset
-#     qinp_out = torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0) #TODO: debug (shouldn't be necessary)
-
-#     # leave first few in fp16
-#     # leave this here for now -> avoids any small perturbations from rescaling
-#     if first_few_fp16 > -1:
-#         qinp_out[:first_few_fp16,:] = orig[:first_few_fp16,:]
-
-#     return qinp_out.float()
 
 
 class SimUniformDynamicCache(Cache):
@@ -175,9 +121,8 @@ class SimUniformDynamicCache(Cache):
         qinp_out = torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0)
         return qinp_out
 
-class SimquantCache(Cache):
+class SimNonUniformCache(Cache):
     def __init__(self, model, quantizers, max_budget=1024) -> None:
-        raise ValueError("Not being used now. Use SimUniformDynamicCache instead.")
 
         self.seq_len = 0
         self.quant_key_len = 0
@@ -193,18 +138,19 @@ class SimquantCache(Cache):
         self.head_dim = self.hidden_size // model.config.num_attention_heads
         self.layers = model.config.num_hidden_layers
         self.quantizers = quantizers
+        self.device = model.device
 
         dtype = model.model.layers[0].self_attn.q_proj.weight.dtype
         self.key_states = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim], dtype=dtype).to(model.device)
         self.value_states = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim], dtype=dtype).to(model.device)
 
-        self.outlier_threshold_upper_keys = torch.zeros([self.layers, 1, self.head_dim*self.num_heads], dtype=dtype).to(model.device)
-        self.outlier_threshold_lower_keys = torch.zeros([self.layers, 1, self.head_dim*self.num_heads], dtype=dtype).to(model.device)
-        self.lut_keys = torch.zeros([self.layers, 2**self.k_bits, 1], dtype=dtype).to(model.device)
+        self.outlier_threshold_upper_keys = torch.zeros([self.layers, self.num_heads, self.head_dim], dtype=dtype).to(model.device)
+        self.outlier_threshold_lower_keys = torch.zeros([self.layers, self.num_heads, self.head_dim], dtype=dtype).to(model.device)
+        self.lut_keys = torch.zeros([self.layers, 2**self.k_bits], dtype=dtype).to(model.device)
 
-        self.outlier_threshold_upper_values = torch.zeros([self.layers, 32768, 1], dtype=dtype).to(model.device)
-        self.outlier_threshold_lower_values = torch.zeros([self.layers, 32768, 1], dtype=dtype).to(model.device)
-        self.lut_values = torch.zeros([self.layers, 2**self.v_bits, 1], dtype=dtype).to(model.device)
+        self.outlier_threshold_upper_values = torch.zeros([self.layers, 1, 32768], dtype=dtype).to(model.device)
+        self.outlier_threshold_lower_values = torch.zeros([self.layers, 1, 32768], dtype=dtype).to(model.device)
+        self.lut_values = torch.zeros([self.layers, 2**self.v_bits], dtype=dtype).to(model.device)
         self.init_simquant(quantizers)
 
     def print_status(self):
@@ -219,64 +165,62 @@ class SimquantCache(Cache):
     
     def init_simquant(self, quantizers):
         for i in range(self.layers):
-            self.outlier_threshold_upper_keys[i] = torch.tensor(quantizers['model.layers.{i}.self_attn.k_proj'][0]).to(self.device)
-            self.outlier_threshold_lower_keys[i] = torch.tensor(quantizers['model.layers.{i}.self_attn.k_proj'][1]).to(self.device)
-            self.lut_keys[i] = torch.tensor(quantizers['model.layers.{i}.self_attn.k_proj'][2][0]).to(self.device)
+            self.outlier_threshold_upper_keys[i] = torch.tensor(quantizers[f'model.layers.{i}.self_attn.k_proj'][0]).to(self.device).reshape(self.num_heads, self.head_dim)
+            self.outlier_threshold_lower_keys[i] = torch.tensor(quantizers[f'model.layers.{i}.self_attn.k_proj'][1]).to(self.device).reshape(self.num_heads, self.head_dim)
+            self.lut_keys[i] = torch.tensor(quantizers[f'model.layers.{i}.self_attn.k_proj'][2][0]).to(self.device).flatten()
 
-            self.outlier_threshold_upper_values[i] = torch.tensor(quantizers['model.layers.{i}.self_attn.v_proj'][2][0]).to(self.device)
-            self.outlier_threshold_lower_values[i] = torch.tensor(quantizers['model.layers.{i}.self_attn.v_proj'][2][1]).to(self.device)
-            self.lut_values[i] = torch.tensor(quantizers['model.layers.{i}.self_attn.v_proj'][2][2]).to(self.device)
+            self.outlier_threshold_upper_values[i] = torch.tensor(quantizers[f'model.layers.{i}.self_attn.v_proj'][0]).to(self.device).reshape(1, 32768)
+            self.outlier_threshold_lower_values[i] = torch.tensor(quantizers[f'model.layers.{i}.self_attn.v_proj'][1]).to(self.device).reshape(1, 32768)
+            self.lut_values[i] = torch.tensor(quantizers[f'model.layers.{i}.self_attn.v_proj'][2][0]).to(self.device).flatten()
+        
+    def simquant(self, inp, maxval, minval, lut, q_channel=-1):
+
+        offset = (maxval + minval) / 2
+        rangeval = (maxval - minval) / 2
+        offset = offset.unsqueeze(q_channel)
+        rangeval = rangeval.unsqueeze(q_channel)
+
+        inp = inp-offset
+        inp_scaled = inp/rangeval
+        qinp_out = round_to_nearest_pole_sim(inp_scaled.flatten(), lut).reshape(inp.shape)
+        qinp_out = qinp_out*rangeval + offset
+        qinp_out = torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0) #TODO: debug (shouldn't be necessary)
+        return qinp_out
+
     
     def update(self, key_states, value_states, layer_idx):
-        # print(key_states.shape, value_states.shape)
-
         self.key_states[layer_idx][:, :, self.seq_len : self.seq_len + key_states.shape[-2]] = key_states
         self.value_states[layer_idx][:, :, self.seq_len : self.seq_len + value_states.shape[-2]] = value_states
 
-        
-        if self.quant_key_len == 0:
-            output = (None, self.key_states[layer_idx][:,:, :self.seq_len+key_states.shape[-2]], None, None,)
-        else:
-            output = (
-                self.key_states[layer_idx][:,:, :, :self.quant_key_len],
-                self.key_states[layer_idx][:,:, self.quant_key_len:self.seq_len+key_states.shape[-2]],
-            )
-        if self.quant_val_len == 0:
-            output += (None, self.value_states_full[layer_idx][:,:, :self.seq_len+value_states.shape[-2]], None, None)
-        else:
-            output += (
-                self.value_states[layer_idx][:,:, :self.quant_val_len],
-                self.value_states[layer_idx][:,:, self.quant_val_len:self.seq_len+value_states.shape[-2]],
+        output = (
+            self.key_states[layer_idx][:,:, :self.seq_len+key_states.shape[-2]], 
+            self.value_states[layer_idx][:,:, :self.seq_len+value_states.shape[-2]], 
             )
         if layer_idx == self.layers-1:
             self.seq_len += key_states.size(2)
         return output
     
     def quantize_and_pack(self):
-    
-        full_val_len = self.seq_len - self.quant_val_len
-        if full_val_len > self.residual_length:
-            to_quant_len = full_val_len-self.residual_length
-            for layer_idx in range(self.layers):
-                value_states_to_quant = self.value_states[layer_idx][:, :, self.quant_val_len:to_quant_len]                
-                self.value_states[layer_idx][:, :, self.quant_val_len:to_quant_len] = self.simquant(
-                    value_states_to_quant, self.v_bits, layer_idx)
-            self.quant_val_len += to_quant_len
-
         full_key_len = self.seq_len - self.quant_key_len
         if full_key_len > self.residual_length:
-            to_quant_len = full_key_len-self.residual_length
+            # assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
+            to_quant_len = full_key_len-(full_key_len%self.residual_length)
             for layer_idx in range(self.layers):
-                key_states_to_quant = self.key_states[layer_idx][:, :, self.quant_key_len:to_quant_len]
-                self.key_states[layer_idx][:, :, self.quant_key_len:to_quant_len] = self.simquant(
-                    key_states_to_quant, self.k_bits, layer_idx)
+                # for i in range(self.quant_key_len, self.quant_key_len+to_quant_len, self.group_size):
+                self.key_states[layer_idx][:, :, self.quant_key_len:self.quant_key_len+to_quant_len] = self.simquant(
+                    self.key_states[layer_idx][:, :, self.quant_key_len:self.quant_key_len+to_quant_len].clone(), self.outlier_threshold_upper_keys[layer_idx], self.outlier_threshold_lower_keys[layer_idx], self.lut_keys[layer_idx], q_channel=-2)
             self.quant_key_len += to_quant_len
+            
+        full_val_len = self.seq_len - self.quant_val_len
+        if full_val_len > self.residual_length:
+            # assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
+            to_quant_len = full_val_len-self.residual_length
+            for layer_idx in range(self.layers):
+                self.value_states[layer_idx][:, :, self.quant_val_len:self.quant_val_len+to_quant_len] = self.simquant(
+                    self.value_states[layer_idx][:, :, self.quant_val_len:self.quant_val_len+to_quant_len].clone(), self.outlier_threshold_upper_values[layer_idx, :, self.quant_val_len:self.quant_val_len+to_quant_len], self.outlier_threshold_lower_values[layer_idx, :, self.quant_val_len:self.quant_val_len+to_quant_len], self.lut_values[layer_idx], q_channel=-1)
+            self.quant_val_len += to_quant_len
 
 
-    def init_simquant(self, quantizer):
-        self.outlier_threshold_upper = [torch.tensor(quantizer[0]).cuda().flatten().half() for _ in range(self.layers)]
-        self.outlier_threshold_lower = torch.tensor(quantizer[1]).cuda().flatten().half()
-                
 class QCache(Cache):
     def __init__(self, model, max_budget=1024) -> None:
         raise ValueError("Not being used now. Use SimUniformDynamicCache instead.")

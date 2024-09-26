@@ -13,18 +13,20 @@ from data.dataset import get_dataset
 # from models.modeling_llama import LlamaForCausalLM_KIVI as LlamaForCausalLM_KIVI2
 from models.modelling_llama_simquant import LlamaForCausalLM_Simquant
 # from models.modeling_llama_68m import LlamaForCausalLM as LlamaForCausalLM_68M
-from models.cache import SimUniformDynamicCache
+from models.cache import SimUniformDynamicCache, SimNonUniformCache
 from utils.decoding import SpecDecode, SimQuantSpecDecode
 from utils.misc import print_config, log_csv
 from utils.graph_infer import GraphInferenceEngine
 from transformers import AutoTokenizer, LlamaConfig
 from models.modelling_llama_kivi  import LlamaForCausalLM_KIVI
+import pickle
 
 import argparse
 def parse_arguments():
     parser = argparse.ArgumentParser(description='args for main.py')
     parser.add_argument('--cache_dir', type=str, default='/rscratch/rishabhtiwari/cache/')
-    parser.add_argument('--quantized_draft', action='store_true', help='verbose')
+    parser.add_argument('--quantized_draft', action='store_true', help='whether to use quantized draft')
+    parser.add_argument('--nuq', action='store_true', help='whether to use nuq')
     parser.add_argument('--k_bits', type=int, default=4, help='k_bits')
     parser.add_argument('--v_bits', type=int, default=4, help='v_bits')
     parser.add_argument('--group_size', type=int, default=32, help='group_size')
@@ -100,9 +102,15 @@ if __name__ == "__main__":
     print_config(draft, target, args.dataset, prefill, gen_len, gamma, top_k, top_p, temperature, args.quantized_draft, args.k_bits, args.v_bits, args.group_size, args.residual_length)
 
     ####### cache init #######
-
-    draft_cache = SimUniformDynamicCache(draft, max_budget=prefill+gen_len+16)
-    target_cache = SimUniformDynamicCache(target, max_budget=prefill+gen_len+16)
+    if args.nuq:
+        assert args.k_bits == 4 and args.v_bits == 4, "NuQ only supports 4-bit K/V"
+        with open('/rscratch/rishabhtiwari/QuantSpec/quant_kivi/kvquant/quantizers.pickle', 'rb') as f:
+            quantizers = pickle.load(f)
+        draft_cache = SimNonUniformCache(draft, quantizers, max_budget=prefill+gen_len+16)
+        target_cache = SimNonUniformCache(target, quantizers, max_budget=prefill+gen_len+16)
+    else:
+        draft_cache = SimUniformDynamicCache(draft, max_budget=prefill+gen_len+16)
+        target_cache = SimUniformDynamicCache(target, max_budget=prefill+gen_len+16)
     
     spec_engine = GraphInferenceEngine(target, target_cache, draft, draft_cache)
 
