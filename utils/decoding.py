@@ -199,6 +199,33 @@ def Autoregressive(tokenizer, graph_engine, input_ids, max_len=256, top_k=-1, to
     # reset all cache
     graph_engine.clear_kv()
 
+    logits, past_key_values = graph_engine.inference_with_kv(input_ids=input_ids)
+
+    if verbose:
+        graph_engine.engine.target_cache.print_status()
+
+    next_token = sample(norm_logits(logits[:,-1,:], temperature=temperature ,top_k=top_k, top_p=top_p))
+    
+    if verbose:
+        spec_stream(next_token[0], tokenizer, 'cyan')
+
+    n = 0
+    time1 = time.time()
+    while n < max_len:
+        logits, past_key_values = graph_engine.inference_with_kv(input_ids=next_token, past_key_values=past_key_values)
+        next_token = sample(norm_logits(logits[:,-1,:], temperature=temperature ,top_k=top_k, top_p=top_p))
+        n += 1
+        if verbose:
+            spec_stream(next_token[0], tokenizer, 'cyan')
+    time2 = time.time()
+    return n / (time2 - time1)
+
+
+@torch.inference_mode()
+def KIVI_Autoregressive(tokenizer, graph_engine, input_ids, max_len=256, top_k=-1, top_p=0.9, temperature=0.6, verbose=False):
+    # reset all cache
+    graph_engine.clear_kv()
+
     logits = graph_engine.inference(input_ids=input_ids)
 
     if verbose:

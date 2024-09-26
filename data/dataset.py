@@ -32,7 +32,7 @@ def get_dataset(dataset_name, tokenizer=None, datalen=None, task=None):
         d_files = os.listdir(datasetparent)
         dataset = load_dataset("json", data_files = [datasetparent + name for name in d_files], split = "train")
         tokenized_prompts = []
-        for i in tqdm(range(20)):
+        for i in tqdm(range(10)):
             prompt = dataset[i]['text']
             tokenized_prompt = tokenizer.encode(prompt, return_tensors="pt")
             tokenized_prompts.append(tokenized_prompt)

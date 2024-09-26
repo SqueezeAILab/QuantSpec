@@ -11,10 +11,11 @@ from termcolor import colored
 from tqdm import tqdm
 from data.dataset import get_dataset
 # from models.modeling_llama import LlamaForCausalLM_KIVI as LlamaForCausalLM_KIVI2
-from models.modelling_llama_simquant import LlamaForCausalLM_Simquant
+# from models.modeling_llama_simquant import LlamaForCausalLM_Simquant
+from models.modeling_llama_simquant_transformer445 import LlamaForCausalLM_Simquant445
 # from models.modeling_llama_68m import LlamaForCausalLM as LlamaForCausalLM_68M
 from models.cache import SimUniformDynamicCache
-from utils.decoding import SpecDecode, SimQuantSpecDecode
+from utils.decoding import SpecDecode, SimQuantSpecDecode, Autoregressive
 from utils.misc import print_config, log_csv
 from utils.graph_infer import GraphInferenceEngine
 from transformers import AutoTokenizer, LlamaConfig
@@ -56,20 +57,21 @@ if __name__ == "__main__":
     config.k_bits = args.k_bits # KiVi currently support 2/4 K/V bits
     config.v_bits = args.v_bits
     config.group_size = args.group_size 
+    config.use_cache = False
     config.residual_length = args.residual_length # corresponding to the number of recent fp16 tokens
     CACHE_DIR = args.cache_dir
-    draft = LlamaForCausalLM_Simquant.from_pretrained(
+    draft = LlamaForCausalLM_Simquant445.from_pretrained(
     pretrained_model_name_or_path=args.draft,
     config=config,
     cache_dir=CACHE_DIR,
-    torch_dtype=torch.float16,
+    torch_dtype=torch.bfloat16,
     device_map="cuda:0"
     )
-    target = LlamaForCausalLM_Simquant.from_pretrained(
+    target = LlamaForCausalLM_Simquant445.from_pretrained(
     pretrained_model_name_or_path=args.target,
     config=config,
     cache_dir=CACHE_DIR,
-    torch_dtype=torch.float16,
+    torch_dtype=torch.bfloat16,
     device_map="cuda:0"
     )
     
@@ -117,9 +119,13 @@ if __name__ == "__main__":
     log_file = "on_chip_results.txt"
     log_csv(log_file, "acceptance_rate, speed\n", "testing")
 
-
-
-
+    ####### Autoregressive on the Target model to make sure it will not behave strange #######
+    n_warmups = 3
+    if config.use_cache: # This means that we are using the transformers' kvcache, not ours
+        for i in tqdm(range(n_warmups), desc="Autoregressive Testing"):
+            input_ids = tokenized_prompts[i].to(target.device)[:,:prefill]
+            Autoregressive(tokenizer, spec_engine, input_ids, max_len=gen_len, top_k=top_k, top_p=top_p, temperature=temperature, verbose=verbose)
+        exit(0)
     ######## Warm up for our method ########
     n_warmups = 1
     input_ids = tokenized_prompts[0].to(target.device)[:,:prefill]
