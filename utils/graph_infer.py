@@ -5,6 +5,7 @@ sys.path.append(root_dir)
 
 import torch
 from typing import List, Optional, Tuple, Union
+from transformers.cache_utils import Cache
 import gc
 import math
 from tqdm import tqdm
@@ -26,11 +27,11 @@ class InferenceEngine:
 
     @torch.inference_mode()
     def target_run(self, input_ids: torch.LongTensor):
-        if input_ids.shape[-1] > 64: # prefill
-            iter_prefill = math.ceil(input_ids.shape[1] / 128)
+        if input_ids.shape[-1] > 4096: # prefill
+            iter_prefill = math.ceil(input_ids.shape[1] / 4096)
             for i in range(iter_prefill):
                 logits = self.target(
-                    input_ids=input_ids[:, i*128:(i+1)*128],
+                    input_ids=input_ids[:, i*4096:(i+1)*4096],
                     kv_cache=self.target_cache,
                 ).logits
         else: # verification
@@ -38,12 +39,29 @@ class InferenceEngine:
         return logits
 
     @torch.inference_mode()
+    def target_run_with_kv(self, input_ids: torch.LongTensor, past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None):
+        if input_ids.shape[-1] > 4096: # prefill
+            iter_prefill = math.ceil(input_ids.shape[1] / 4096)
+            for i in range(iter_prefill):
+                output = self.target(
+                    input_ids=input_ids[:, i*4096:(i+1)*4096],
+                    past_key_values=past_key_values
+                )
+                logits = output.logits
+                past_key_values = output.past_key_values
+        else: # verification
+            output = self.target(input_ids=input_ids, past_key_values=past_key_values)
+            logits = output.logits
+            past_key_values = output.past_key_values
+        return logits, past_key_values
+
+    @torch.inference_mode()
     def draft_run(self, input_ids: torch.LongTensor, probs=False, temperature=0.6, top_p=0.9):
-        if input_ids.shape[-1] > 128: # prefill
-            iter_prefill = math.ceil(input_ids.shape[1] / 128)
+        if input_ids.shape[-1] > 4096: # prefill
+            iter_prefill = math.ceil(input_ids.shape[1] / 4096)
             for i in range(iter_prefill):
                 logits = self.draft(
-                    input_ids=input_ids[:, i*128:(i+1)*128],
+                    input_ids=input_ids[:, i*4096:(i+1)*4096],
                     kv_cache=self.draft_cache,
                 ).logits
         else: # decoding
@@ -176,6 +194,11 @@ class GraphInferenceEngine:
     def inference(self, input_ids: torch.LongTensor):
         # model run
         return self.engine.target_run(input_ids=input_ids)
+
+    @torch.inference_mode()
+    def inference_with_kv(self, input_ids: torch.LongTensor, past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None):
+        # model run
+        return self.engine.target_run_with_kv(input_ids=input_ids, past_key_values=past_key_values)
 
     @torch.inference_mode()
     def draft_inference(self, input_ids: torch.LongTensor, gamma_offset: int=0):
