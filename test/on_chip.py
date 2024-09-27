@@ -61,7 +61,7 @@ if __name__ == "__main__":
     config.use_cache = False
     config.residual_length = args.residual_length # corresponding to the number of recent fp16 tokens
     CACHE_DIR = args.cache_dir
-    draft = LlamaForCausalLM_Simquant.from_pretrained(
+    draft = LlamaForCausalLM_Simquant445.from_pretrained(
     pretrained_model_name_or_path=args.draft,
     config=config,
     cache_dir=CACHE_DIR,
