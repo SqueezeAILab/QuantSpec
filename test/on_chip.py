@@ -32,8 +32,8 @@ def parse_arguments():
     parser.add_argument('--group_size', type=int, default=32, help='group_size')
     parser.add_argument('--residual_length', type=int, default=32, help='residual_length')
 
-    parser.add_argument('--target', type=str, default='meta-llama/Llama-2-7b-hf', help='target model')
-    parser.add_argument('--draft', type=str, default='meta-llama/Llama-2-7b-hf', help='draft model')
+    parser.add_argument('--target', type=str, default='meta-llama/Meta-Llama-3.1-8B', help='target model')
+    parser.add_argument('--draft', type=str, default='meta-llama/Meta-Llama-3.1-8B', help='draft model')
     parser.add_argument('--verbose', action='store_true', help='verbose')
 
     parser.add_argument('--prefill', type=int, default=32768, help='prefill length')
@@ -129,14 +129,14 @@ if __name__ == "__main__":
 
 
     ######## Warm up for our method ########
-    n_warmups = 1
-    input_ids = tokenized_prompts[0].to(target.device)[:,:prefill]
-    for i in tqdm(range(n_warmups), desc="SpecDecode Warmup"):
-        decoding_fn(tokenizer, spec_engine, input_ids, gamma=gamma, max_len=gen_len, top_k=top_k, top_p=top_p, temperature=temperature, verbose=verbose, file_path=None, dataset=args.dataset)
+    # n_warmups = 1
+    # input_ids = tokenized_prompts[0].to(target.device)[:,:prefill]
+    # for i in tqdm(range(n_warmups), desc="SpecDecode Warmup"):
+    #     decoding_fn(tokenizer, spec_engine, input_ids, gamma=gamma, max_len=gen_len, top_k=top_k, top_p=top_p, temperature=temperature, verbose=verbose, file_path=None, dataset=args.dataset)
 
     all_acceptance_rate = []
     all_speed = []
-    for input_ids in tqdm(tokenized_prompts[:4], desc="SpecDecode Test"):
+    for input_ids in tqdm(tokenized_prompts[:5], desc="SpecDecode Test"):
         input_ids = input_ids.to(target.device)[:,:prefill]
 
         acceptance_rate, speed = decoding_fn(tokenizer, spec_engine, input_ids, gamma=gamma, max_len=gen_len, top_k=top_k, top_p=top_p, temperature=temperature, verbose=verbose, file_path=None, dataset=args.dataset)

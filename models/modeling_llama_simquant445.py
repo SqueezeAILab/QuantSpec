@@ -17,38 +17,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """ PyTorch LLaMA model."""
-import math
-import os
-import time
 import warnings
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from flash_attn import flash_attn_func, flash_attn_varlen_func
-from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
-from transformers.activations import ACT2FN
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
-    SequenceClassifierOutputWithPast,
 )
-from transformers.modeling_utils import PreTrainedModel
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
     LlamaDecoderLayer,
-    LlamaDynamicNTKScalingRotaryEmbedding,
-    LlamaFlashAttention2,
-    LlamaForCausalLM,
-    LlamaForSequenceClassification,
-    LlamaLinearScalingRotaryEmbedding,
     LlamaMLP,
     LlamaModel,
     LlamaPreTrainedModel,
@@ -56,8 +43,6 @@ from transformers.models.llama.modeling_llama import (
     LlamaRotaryEmbedding,
     LlamaSdpaAttention,
     apply_rotary_pos_emb,
-    repeat_kv,
-    rotate_half,
 )
 from transformers.utils import (
     logging,
@@ -139,22 +124,30 @@ class LlamaFlashAttention2_Simquant445(LlamaAttention_Simquant445):
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-            # if key_states.shape[-2] > 4096:
+            # if self.layer_idx == 0:
             #     import IPython
             #     IPython.embed()
+
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+            # if self.layer_idx == 0:
+            #     import IPython
+            #     IPython.embed()
+
         elif kv_cache is not None:
             ''' Our Logic Here '''
 
             # assert self.num_key_value_groups == 1
             # [bsz, nh, t, hd]
             # if kv_cache is not None:
+            # if self.layer_idx == 0:
+            #     import IPython
+            #     IPython.embed()
             past_key_value = kv_cache.update(key_states, value_states, layer_idx=self.layer_idx)
             key_states = past_key_value[0]
             value_states = past_key_value[1]
 
-            # if key_states.shape[-2] > 4096:
+            # if self.layer_idx == 0:
             #     import IPython
             #     IPython.embed()
 
