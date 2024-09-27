@@ -58,9 +58,10 @@ if __name__ == "__main__":
     config.k_bits = args.k_bits # KiVi currently support 2/4 K/V bits
     config.v_bits = args.v_bits
     config.group_size = args.group_size 
+    config.use_cache = False
     config.residual_length = args.residual_length # corresponding to the number of recent fp16 tokens
     CACHE_DIR = args.cache_dir
-    draft = LlamaForCausalLM_Simquant445.from_pretrained(
+    draft = LlamaForCausalLM_Simquant.from_pretrained(
     pretrained_model_name_or_path=args.draft,
     config=config,
     cache_dir=CACHE_DIR,

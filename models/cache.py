@@ -71,6 +71,7 @@ class SimUniformDynamicCache(Cache):
     def update(self, key_states, value_states, layer_idx):
         self.key_states[layer_idx][:, :, self.seq_len : self.seq_len + key_states.shape[-2]] = key_states
         self.value_states[layer_idx][:, :, self.seq_len : self.seq_len + value_states.shape[-2]] = value_states
+        # print(key_states.shape, value_states.shape)
 
         output = (
             self.key_states[layer_idx][:,:, :self.seq_len+key_states.shape[-2]], 
@@ -103,6 +104,9 @@ class SimUniformDynamicCache(Cache):
         
     
     def simquant(self, inp, bits, q_channel=-1):
+        if bits == -16:
+            return inp
+        
         maxval = torch.max(inp, dim=q_channel).values
         minval = torch.min(inp, dim=q_channel).values
         # print('inp', inp.shape)
