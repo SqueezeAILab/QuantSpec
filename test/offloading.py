@@ -11,7 +11,7 @@ from termcolor import colored
 from tqdm import tqdm
 
 from data.dataset import get_dataset
-from models.modeling_llama import LlamaForCausalLM
+from models.modeling_llama_simquant445 import LlamaForCausalLM
 from models.modeling_llama_68m import LlamaForCausalLM as LlamaForCausalLM_68M
 from models.cache import OffloadingFlashSimpleCache, StreamingLLMEvictionCache, RetrievalCache
 from utils.decoding import TriForce, Autoregressive

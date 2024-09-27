@@ -11,7 +11,7 @@ from termcolor import colored
 from tqdm import tqdm
 from data.dataset import get_dataset
 # from models.modeling_llama import LlamaForCausalLM_KIVI as LlamaForCausalLM_KIVI2
-from models.modelling_llama_simquant import LlamaForCausalLM_Simquant
+from models.modeling_llama_simquant445 import LlamaForCausalLM_Simquant445
 # from models.modeling_llama_68m import LlamaForCausalLM as LlamaForCausalLM_68M
 from models.cache import SimUniformDynamicCache, SimNonUniformCache
 from utils.decoding import SpecDecode, SimQuantSpecDecode
@@ -43,9 +43,8 @@ def parse_arguments():
     parser.add_argument('--dataset', type=str, default='gs', help='dataset')
     parser.add_argument('--temp', type=float, default=0.6, help='temperature')
     parser.add_argument('--top_p', type=float, default=0.9, help='top p')
-    # parser.add_argument('--budget', type=int, default=4096)
-    # parser.add_argument('--draft_cache_budget', type=int, default=256, help='draft cache budget')
-    # parser.add_argument('--chunk_size', type=int, default=8, help='chunk size')
+    parser.add_argument('--log_file', type=str, default='on_chip_results.txt', help='log file')
+    parser.add_argument('--identifier_string', type=str, default='', help='identifier string')
     args = parser.parse_args()
     
     return args
@@ -55,23 +54,24 @@ if __name__ == "__main__":
     args = parse_arguments()
 
     config = LlamaConfig.from_pretrained(args.draft)
+    config.use_cache = False
     config.k_bits = args.k_bits # KiVi currently support 2/4 K/V bits
     config.v_bits = args.v_bits
     config.group_size = args.group_size 
     config.residual_length = args.residual_length # corresponding to the number of recent fp16 tokens
     CACHE_DIR = args.cache_dir
-    draft = LlamaForCausalLM_Simquant.from_pretrained(
+    draft = LlamaForCausalLM_Simquant445.from_pretrained(
     pretrained_model_name_or_path=args.draft,
     config=config,
     cache_dir=CACHE_DIR,
-    torch_dtype=torch.float16,
+    torch_dtype=torch.bfloat16,
     device_map="cuda:0"
     )
-    target = LlamaForCausalLM_Simquant.from_pretrained(
+    target = LlamaForCausalLM_Simquant445.from_pretrained(
     pretrained_model_name_or_path=args.target,
     config=config,
     cache_dir=CACHE_DIR,
-    torch_dtype=torch.float16,
+    torch_dtype=torch.bfloat16,
     device_map="cuda:0"
     )
     
@@ -98,7 +98,7 @@ if __name__ == "__main__":
     verbose = args.verbose
     # chunk_size = args.chunk_size
     # max_budget = args.budget
-    log_file = "on_chip_results.txt"
+    log_file = args.log_file
     print_config(draft, target, args.dataset, prefill, gen_len, gamma, top_k, top_p, temperature, args.quantized_draft, args.k_bits, args.v_bits, args.group_size, args.residual_length)
 
     ####### cache init #######
@@ -122,8 +122,7 @@ if __name__ == "__main__":
 
     decoding_fn = SimQuantSpecDecode if args.quantized_draft else SpecDecode
 
-    log_file = "on_chip_results.txt"
-    log_csv(log_file, "acceptance_rate, speed\n", "testing")
+    log_csv(log_file, "average_acceptance_rate, acceptance_rate_list, average_latency\n", f"{args.identifier_string}, {args.dataset}, {args.prefill}, {args.k_bits}, {args.v_bits}, {args.group_size}\n")
 
 
 

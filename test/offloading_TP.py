@@ -12,7 +12,7 @@ import argparse
 from termcolor import colored
 from utils.decoding import Baseline_Dist, TriForce_Dist
 from models.TP_llama import distributed_init, DistributedLlama
-from models.modeling_llama import LlamaForCausalLM
+from models.modeling_llama_simquant445 import LlamaForCausalLM
 from models.modeling_llama_68m import LlamaForCausalLM as LlamaForCausalLM_68M
 from models.cache import StreamingLLMEvictionCache
 from transformers import AutoTokenizer

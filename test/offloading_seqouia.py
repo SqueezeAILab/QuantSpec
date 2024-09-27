@@ -11,7 +11,7 @@ import argparse
 from termcolor import colored
 from utils.decoding import Baseline_Dist
 from models.TP_llama_tree import distributed_init, DistributedLlama
-from models.modeling_llama import LlamaForCausalLM
+from models.modeling_llama_simquant445 import LlamaForCausalLM
 from transformers import AutoTokenizer
 import numpy as np
 import time

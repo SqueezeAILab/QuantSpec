@@ -5,4 +5,4 @@ if [ $# -eq 0 ]; then
     exit 1
 fi
 
-CUDA_VISIBLE_DEVICES=$1 python test/on_chip.py --prefill 128 --quantized_draft --verbose --gamma 6 --nuq --draft /rscratch/llama-7b/ --target /rscratch/llama-7b/
+CUDA_VISIBLE_DEVICES=$1 python test/on_chip.py --prefill 4096 --quantized_draft --verbose --gamma 6 --draft meta-llama/Meta-Llama-3.1-8B --target meta-llama/Meta-Llama-3.1-8B
