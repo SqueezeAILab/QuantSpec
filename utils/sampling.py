@@ -53,7 +53,8 @@ def norm_logits(logits : torch.Tensor, temperature=0.6, top_k=-1, top_p=0.9) -> 
         torch.Tensor: next token with shape as (batch,  1)
     """
     assert logits.dim() == 2
-    logits = logits / temperature
+    if temperature > 0.0:
+        logits = logits / temperature
     logits = top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)
 
     probs = F.softmax(logits, dim=-1)
@@ -62,6 +63,7 @@ def norm_logits(logits : torch.Tensor, temperature=0.6, top_k=-1, top_p=0.9) -> 
 
 def sample(probs : torch.Tensor, num_samples=1):
     idx_next = torch.multinomial(probs, num_samples=num_samples, replacement=True)
+    # print(idx_next)
     return idx_next
 
 

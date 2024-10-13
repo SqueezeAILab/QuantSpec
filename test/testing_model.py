@@ -11,11 +11,12 @@ from termcolor import colored
 from tqdm import tqdm
 from data.dataset import get_dataset
 from models.modeling_llama_simquant445 import LlamaForCausalLM_Simquant445
-from models.cache import SimUniformDynamicCache, SimNonUniformCache
+from models.cache import SimUniformDynamicCache, SimNonUniformCache, QCache
 from utils.decoding import SpecDecode, SimQuantSpecDecode, Autoregressive, KIVI_Autoregressive
 from utils.misc import print_config, log_csv
 from utils.graph_infer import GraphInferenceEngine
 from transformers import AutoTokenizer, LlamaConfig
+from models.modelling_llama_kivi  import LlamaForCausalLM_KIVI445
 import pickle
 
 import argparse
@@ -51,25 +52,24 @@ if __name__ == "__main__":
     args = parse_arguments()
 
     config = LlamaConfig.from_pretrained(args.draft)
-    config.use_cache = False
     config.k_bits = args.k_bits # KiVi currently support 2/4 K/V bits
     config.v_bits = args.v_bits
     config.group_size = args.group_size 
-    config.use_cache = True
+    config.use_cache = False
     config.residual_length = args.residual_length # corresponding to the number of recent fp16 tokens
     CACHE_DIR = args.cache_dir
-    draft = LlamaForCausalLM_Simquant445.from_pretrained(
+    draft = LlamaForCausalLM_KIVI445.from_pretrained(
     pretrained_model_name_or_path=args.draft,
     config=config,
     cache_dir=CACHE_DIR,
-    torch_dtype=torch.bfloat16,
+    torch_dtype=torch.float16,
     device_map="cuda:0"
     )
-    target = LlamaForCausalLM_Simquant445.from_pretrained(
+    target = LlamaForCausalLM_KIVI445.from_pretrained(
     pretrained_model_name_or_path=args.target,
     config=config,
     cache_dir=CACHE_DIR,
-    torch_dtype=torch.bfloat16,
+    torch_dtype=torch.float16,
     device_map="cuda:0"
     )
     
@@ -107,8 +107,8 @@ if __name__ == "__main__":
         draft_cache = SimNonUniformCache(draft, quantizers, max_budget=prefill+gen_len+16)
         target_cache = SimNonUniformCache(target, quantizers, max_budget=prefill+gen_len+16)
     else:
-        draft_cache = SimUniformDynamicCache(draft, max_budget=prefill+gen_len+16)
-        target_cache = SimUniformDynamicCache(target, max_budget=prefill+gen_len+16)
+        draft_cache = QCache(draft, max_budget=prefill+gen_len+16)
+        target_cache = QCache(target, max_budget=prefill+gen_len+16)
     
     spec_engine = GraphInferenceEngine(target, target_cache, draft, draft_cache)
 

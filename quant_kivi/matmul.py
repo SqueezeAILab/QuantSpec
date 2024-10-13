@@ -3,7 +3,7 @@ import torch
 import random
 import triton
 import triton.language as tl
-# import kivi_gemv 
+import kivi_gemv 
 
 
 @triton.jit

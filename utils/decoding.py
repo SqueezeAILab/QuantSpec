@@ -130,8 +130,10 @@ def SimQuantSpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, to
         verify_tokens[:, 0] = next_token
         speculation_probs = []
         for i in range(gamma):
-            spec_engine.engine.draft_cache.seq_len -= i
-            logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,:i+1])
+            # print(i)
+            # spec_engine.engine.draft_cache.seq_len -= i
+            # logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,:i+1])
+            logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,i:i+1])
             prob = norm_logits(logits_[:,-1,:], temperature=temperature ,top_k=top_k, top_p=top_p).squeeze()
             speculation_probs.append(prob)
             next_token = sample(prob)
@@ -148,6 +150,7 @@ def SimQuantSpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, to
         
         for i, speculation_prob, verify_prob in zip(verify_tokens[0,1:], speculation_probs, verify_probs):
             r = torch.rand(1, device = spec_engine.engine.target.device)
+            # print(r, verify_prob[i] / speculation_prob[i])
             if r < torch.min(torch.tensor([1], device=r.device), (verify_prob[i] / speculation_prob[i])):
                 count += 1
                 accepted_count += 1
@@ -175,8 +178,9 @@ def SimQuantSpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, to
         if count == gamma:
             n += 1
             pred_token_idx = sample(verify_probs[-1])
-            spec_engine.engine.draft_cache.seq_len -= gamma
-            spec_engine.draft_inference(input_ids=verify_tokens)
+            # spec_engine.engine.draft_cache.seq_len -= gamma
+            # spec_engine.draft_inference(input_ids=verify_tokens)
+            spec_engine.draft_inference(input_ids=verify_tokens[:,-1:])
             if verbose:
                 spec_stream(pred_token_idx, tokenizer, 'blue')
             count += 1
@@ -227,6 +231,7 @@ def KIVI_Autoregressive(tokenizer, graph_engine, input_ids, max_len=256, top_k=-
     graph_engine.clear_kv()
 
     logits = graph_engine.inference(input_ids=input_ids)
+    # graph_engine.engine.target_cache.quantize_and_pack()
 
     if verbose:
         graph_engine.engine.target_cache.print_status()
@@ -240,6 +245,7 @@ def KIVI_Autoregressive(tokenizer, graph_engine, input_ids, max_len=256, top_k=-
     time1 = time.time()
     while n < max_len:
         logits = graph_engine.inference(input_ids=next_token)
+        # graph_engine.engine.target_cache.quantize_and_pack()
         next_token = sample(norm_logits(logits[:,-1,:], temperature=temperature ,top_k=top_k, top_p=top_p))
         n += 1
         if verbose:

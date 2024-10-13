@@ -10,16 +10,17 @@ from transformers import AutoTokenizer
 from termcolor import colored
 from tqdm import tqdm
 from data.dataset import get_dataset
-# from models.modeling_llama import LlamaForCausalLM_KIVI as LlamaForCausalLM_KIVI2
 from models.modeling_llama_simquant445 import LlamaForCausalLM_Simquant445
-# from models.modeling_llama_68m import LlamaForCausalLM as LlamaForCausalLM_68M
-from models.cache import SimUniformDynamicCache, SimNonUniformCache
+from models.modelling_llama_simquantkivi import LlamaForCausalLM_KIVI445 as LlamaForCausalLM_SimKIVI445
+from models.cache import SimUniformDynamicCache, SimNonUniformCache, QCache, SimQCache
 from utils.decoding import SpecDecode, SimQuantSpecDecode
-from utils.misc import print_config, log_csv
+from utils.misc import print_config, log_csv, seed_everything
 from utils.graph_infer import GraphInferenceEngine
 from transformers import AutoTokenizer, LlamaConfig
-from models.modelling_llama_kivi  import LlamaForCausalLM_KIVI
+from models.modelling_llama_kivi  import LlamaForCausalLM_KIVI445
 import pickle
+
+seed_everything(43)
 
 import argparse
 def parse_arguments():
@@ -27,10 +28,12 @@ def parse_arguments():
     parser.add_argument('--cache_dir', type=str, default='/rscratch/rishabhtiwari/cache/')
     parser.add_argument('--quantized_draft', action='store_true', help='whether to use quantized draft')
     parser.add_argument('--nuq', action='store_true', help='whether to use nuq')
+    parser.add_argument('--simquant', action='store_true', help='whether to use simulated quantization')
     parser.add_argument('--k_bits', type=int, default=4, help='k_bits')
     parser.add_argument('--v_bits', type=int, default=4, help='v_bits')
     parser.add_argument('--group_size', type=int, default=32, help='group_size')
     parser.add_argument('--residual_length', type=int, default=32, help='residual_length')
+    parser.add_argument('--attn', type=str, default='eager', help='attn implementation')
 
     parser.add_argument('--target', type=str, default='meta-llama/Meta-Llama-3.1-8B', help='target model')
     parser.add_argument('--draft', type=str, default='meta-llama/Meta-Llama-3.1-8B', help='draft model')
@@ -50,7 +53,7 @@ def parse_arguments():
     return args
 
 if __name__ == "__main__":
-
+    seed_everything(43)
     args = parse_arguments()
 
     config = LlamaConfig.from_pretrained(args.draft)
@@ -59,20 +62,26 @@ if __name__ == "__main__":
     config.v_bits = args.v_bits
     config.group_size = args.group_size 
     config.use_cache = False
+    config._attn_implementation = args.attn
     config.residual_length = args.residual_length # corresponding to the number of recent fp16 tokens
     CACHE_DIR = args.cache_dir
-    draft = LlamaForCausalLM_Simquant445.from_pretrained(
+    if args.simquant:
+        draft_class = LlamaForCausalLM_SimKIVI445
+    else:
+        draft_class = LlamaForCausalLM_KIVI445
+    draft = draft_class.from_pretrained(
     pretrained_model_name_or_path=args.draft,
     config=config,
     cache_dir=CACHE_DIR,
-    torch_dtype=torch.bfloat16,
+    torch_dtype=torch.float16,
     device_map="cuda:0"
     )
+    
     target = LlamaForCausalLM_Simquant445.from_pretrained(
     pretrained_model_name_or_path=args.target,
     config=config,
     cache_dir=CACHE_DIR,
-    torch_dtype=torch.bfloat16,
+    torch_dtype=torch.float16,
     device_map="cuda:0"
     )
     
@@ -109,8 +118,11 @@ if __name__ == "__main__":
             quantizers = pickle.load(f)
         draft_cache = SimNonUniformCache(draft, quantizers, max_budget=prefill+gen_len+16)
         target_cache = SimNonUniformCache(target, quantizers, max_budget=prefill+gen_len+16)
+    elif args.simquant:
+        draft_cache = SimQCache(draft, max_budget=prefill+gen_len+16)
+        target_cache = SimUniformDynamicCache(target, max_budget=prefill+gen_len+16)
     else:
-        draft_cache = SimUniformDynamicCache(draft, max_budget=prefill+gen_len+16)
+        draft_cache = QCache(draft, max_budget=prefill+gen_len+16)
         target_cache = SimUniformDynamicCache(target, max_budget=prefill+gen_len+16)
     
     spec_engine = GraphInferenceEngine(target, target_cache, draft, draft_cache)

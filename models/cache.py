@@ -103,6 +103,28 @@ class SimUniformDynamicCache(Cache):
             self.quant_val_len += to_quant_len
         
     
+    # def simquant(self, inp, bits, q_channel=-1):
+    #     if bits == -16:
+    #         return inp
+        
+    #     maxval = torch.max(inp, dim=q_channel).values
+    #     minval = torch.min(inp, dim=q_channel).values
+    #     # print('inp', inp.shape)
+
+
+    #     rangeval = (maxval - minval) / 1.
+    #     qx = (2**bits - 1) / rangeval
+    #     offset = minval * qx
+    #     offset = offset.unsqueeze(q_channel)
+    #     qx = qx.unsqueeze(q_channel)
+    #     # print('qx', qx.shape)
+    #     # print('offset', offset.shape)
+    #     qinp = torch.round(qx * inp - offset)
+    #     qinp = torch.clip(qinp, min=0, max=2**bits - 1)
+    #     qinp_out = (qinp + offset) / qx
+    #     qinp_out = torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0)
+    #     return qinp_out
+    
     def simquant(self, inp, bits, q_channel=-1):
         if bits == -16:
             return inp
@@ -111,19 +133,14 @@ class SimUniformDynamicCache(Cache):
         minval = torch.min(inp, dim=q_channel).values
         # print('inp', inp.shape)
 
+        scale = (maxval - minval)/(2**bits - 1)
+        q_inp = inp - minval.unsqueeze(q_channel)
+        q_inp = q_inp / scale.unsqueeze(q_channel)
 
-        rangeval = (maxval - minval) / 1.
-        qx = (2**bits - 1) / rangeval
-        offset = minval * qx
-        offset = offset.unsqueeze(q_channel)
-        qx = qx.unsqueeze(q_channel)
-        # print('qx', qx.shape)
-        # print('offset', offset.shape)
-        qinp = torch.round(qx * inp - offset)
-        qinp = torch.clip(qinp, min=0, max=2**bits - 1)
-        qinp_out = (qinp + offset) / qx
-        qinp_out = torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0)
-        return qinp_out
+        q_inp = torch.clip(q_inp, min=0, max=2**bits-1).round().to(torch.int32).clone()
+        q_inp_out = q_inp*scale.unsqueeze(q_channel) + minval.unsqueeze(q_channel)
+        q_inp_out = torch.nan_to_num(q_inp_out, nan=0.0, posinf=0.0, neginf=0.0)
+        return q_inp_out
 
 class SimNonUniformCache(Cache):
     def __init__(self, model, quantizers, max_budget=1024) -> None:
@@ -224,11 +241,137 @@ class SimNonUniformCache(Cache):
                     self.value_states[layer_idx][:, :, self.quant_val_len:self.quant_val_len+to_quant_len].clone(), self.outlier_threshold_upper_values[layer_idx, :, self.quant_val_len:self.quant_val_len+to_quant_len], self.outlier_threshold_lower_values[layer_idx, :, self.quant_val_len:self.quant_val_len+to_quant_len], self.lut_values[layer_idx], q_channel=-1)
             self.quant_val_len += to_quant_len
 
+class SimQCache(Cache):
+    def __init__(self, model, max_budget=1024) -> None:
+        self.seq_len = 0
+        self.quant_key_len = 0
+        self.quant_val_len = 0
+        self.residual_length = model.config.residual_length
+        # self.num_key_value_heads = model.config.num_key_value_heads
+        self.group_size = model.config.group_size
+        self.k_bits = model.config.k_bits
+        self.v_bits = model.config.v_bits
+        self.max_budget = max_budget
+
+        self.hidden_size = model.config.hidden_size
+        self.num_heads = model.config.num_key_value_heads
+        self.head_dim = self.hidden_size // model.config.num_attention_heads
+        self.layers = model.config.num_hidden_layers
+
+        dtype = model.model.layers[0].self_attn.q_proj.weight.dtype
+        self.key_states_quant_trans = torch.zeros([self.layers, 1, self.num_heads, self.head_dim, self.max_budget], dtype=torch.int32).to(model.device)
+        self.key_scale_trans = torch.zeros([self.layers, 1, self.num_heads, self.head_dim, self.max_budget//self.group_size], dtype=dtype).to(model.device)
+        self.key_mn_trans = torch.zeros([self.layers, 1, self.num_heads, self.head_dim, self.max_budget//self.group_size], dtype=dtype).to(model.device)
+        self.key_states_full = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim], dtype=dtype).to(model.device)
+
+
+        self.value_states_quant = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim], dtype=torch.int32).to(model.device)
+        self.value_scale = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim//self.group_size], dtype=dtype).to(model.device)
+        self.value_mn = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim//self.group_size], dtype=dtype).to(model.device)
+        self.value_states_full = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim], dtype=dtype).to(model.device)
+
+    def print_status(self):
+        print("[Full Cache] Cached:", self.seq_len, "| Quantized:", self.quant_key_len, self.quant_val_len, "| full_precision:", self.seq_len-self.quant_key_len, self.seq_len-self.quant_val_len)
+
+    def reset(self):
+        self.seq_len = 0
+        self.quant_key_len = 0
+        self.quant_val_len = 0
+        self.key_states_full.zero_()
+        self.value_states_full.zero_()
+        self.key_states_quant_trans.zero_()
+        self.key_scale_trans.zero_()
+        self.key_mn_trans.zero_()
+        self.value_states_quant.zero_()
+        self.value_scale.zero_()
+        self.value_mn.zero_()
+    
+    def update(self, key_states, value_states, layer_idx):
+
+        self.key_states_full[layer_idx][:, :, self.seq_len-self.quant_key_len : self.seq_len - self.quant_key_len + key_states.shape[-2]] = key_states
+        self.value_states_full[layer_idx][:, :, self.seq_len-self.quant_val_len : self.seq_len - self.quant_val_len + value_states.shape[-2]] = value_states
+
+
+        if self.quant_key_len == 0:
+            output = (None, self.key_states_full[layer_idx][:,:, :self.seq_len+key_states.shape[-2]], None, None,)
+        else:
+            output = (
+                self.key_states_quant_trans[layer_idx][:,:, :, :self.quant_key_len],
+                self.key_states_full[layer_idx][:,:, :self.seq_len-self.quant_key_len+key_states.shape[-2]],
+                self.key_scale_trans[layer_idx][:,:, :, :self.quant_key_len//self.group_size],       
+                self.key_mn_trans[layer_idx][:,:, :, :self.quant_key_len//self.group_size],
+            )
+        if self.quant_val_len == 0:
+            output += (None, self.value_states_full[layer_idx][:,:, :self.seq_len-self.quant_val_len+value_states.shape[-2]], None, None)
+        else:
+            output += (
+                self.value_states_quant[layer_idx][:,:, :self.quant_val_len],
+                self.value_states_full[layer_idx][:,:, :self.seq_len-self.quant_val_len+value_states.shape[-2]],
+                self.value_scale[layer_idx][:,:, :self.quant_val_len],
+                self.value_mn[layer_idx][:,:, :self.quant_val_len],
+            )
+        if layer_idx == self.layers-1:
+            self.seq_len += key_states.size(2)
+        return output 
+    
+    def quantize_and_pack(self):
+        full_key_len = self.seq_len - self.quant_key_len
+        if full_key_len > self.residual_length:
+            assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
+            to_quant_len = full_key_len-(full_key_len%self.residual_length)
+            for layer_idx in range(self.layers):
+                to_quant_key_states = self.key_states_full[layer_idx][:, :, :to_quant_len].clone()
+                self.key_states_full[layer_idx][:, :, :-to_quant_len] = self.key_states_full[layer_idx][:, :, to_quant_len:].clone()
+                
+                
+                key_states_quant_trans_new, key_scale_trans_new, key_mn_trans_new = self.quantize_and_pack_along_last_dim(
+                    to_quant_key_states.transpose(2,3).contiguous(), self.group_size, self.k_bits
+                )
+                self.key_states_quant_trans[layer_idx][:, :, :, self.quant_key_len:(self.quant_key_len+to_quant_len)] = key_states_quant_trans_new
+                self.key_scale_trans[layer_idx][:, :, :, self.quant_key_len//self.group_size:(self.quant_key_len+to_quant_len)//self.group_size] = key_scale_trans_new
+                self.key_mn_trans[layer_idx][:, :, :, self.quant_key_len//self.group_size:(self.quant_key_len+to_quant_len)//self.group_size] = key_mn_trans_new
+            self.quant_key_len += to_quant_len
+
+        full_val_len = self.seq_len - self.quant_val_len
+        if full_val_len > self.residual_length:
+            assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
+            to_quant_len = full_val_len-self.residual_length
+            for layer_idx in range(self.layers):
+                value_states_full = self.value_states_full[layer_idx][:, :, :to_quant_len].clone()
+                self.value_states_full[layer_idx][:, :, :-(to_quant_len)] = self.value_states_full[layer_idx][:, :, to_quant_len:].clone().contiguous()
+                
+                value_states_quant_new, value_scale_new, value_mn_new = self.quantize_and_pack_along_last_dim(
+                    value_states_full.contiguous(), self.group_size, self.v_bits
+                )
+                self.value_states_quant[layer_idx][:, :, self.quant_val_len:(self.quant_val_len+to_quant_len)] = value_states_quant_new.contiguous()
+                self.value_scale[layer_idx][:, :, self.quant_val_len:(self.quant_val_len+to_quant_len)] = value_scale_new
+                self.value_mn[layer_idx][:, :, self.quant_val_len:(self.quant_val_len+to_quant_len)] = value_mn_new
+            self.quant_val_len += to_quant_len
+
+    def quantize_and_pack_along_last_dim(self, inp, group_size, bits):
+        # import IPython
+        # IPython.embed()
+        num_groups = inp.size(-1) // group_size
+        
+        inp = inp.reshape(*inp.shape[:-1], num_groups, group_size)
+        maxval = torch.max(inp, dim=-1).values
+        minval = torch.min(inp, dim=-1).values
+        # print('inp', inp.shape)
+
+        scale = (maxval - minval)/(2**bits - 1)
+        q_inp = inp - minval.unsqueeze(-1)
+        q_inp = q_inp / scale.unsqueeze(-1)
+
+        q_inp = torch.clip(q_inp, min=0, max=2**bits-1).round().to(torch.int32)
+        # q_inp_out = q_inp*scale.unsqueeze(-1) + minval.unsqueeze(-1)
+        # q_inp_out = torch.nan_to_num(q_inp_out, nan=0.0, posinf=0.0, neginf=0.0)
+        # import IPython
+        # IPython.embed()
+        return q_inp.reshape(*inp.shape[:-2], -1), scale, minval
+
 
 class QCache(Cache):
     def __init__(self, model, max_budget=1024) -> None:
-        raise ValueError("Not being used now. Use SimUniformDynamicCache instead.")
-
         self.seq_len = 0
         self.quant_key_len = 0
         self.quant_val_len = 0
@@ -274,8 +417,8 @@ class QCache(Cache):
     
     def update(self, key_states, value_states, layer_idx):
 
-        self.key_states_full[layer_idx][:, :, self.seq_len-self.quant_key_len : self.seq_len - self.quant_key_len + key_states.shape[-2]] = key_states.contiguous()
-        self.value_states_full[layer_idx][:, :, self.seq_len-self.quant_val_len : self.seq_len - self.quant_val_len + value_states.shape[-2]] = value_states.contiguous()
+        self.key_states_full[layer_idx][:, :, self.seq_len-self.quant_key_len : self.seq_len - self.quant_key_len + key_states.shape[-2]] = key_states
+        self.value_states_full[layer_idx][:, :, self.seq_len-self.quant_val_len : self.seq_len - self.quant_val_len + value_states.shape[-2]] = value_states
 
 
         if self.quant_key_len == 0:
@@ -307,7 +450,7 @@ class QCache(Cache):
             to_quant_len = full_key_len-(full_key_len%self.residual_length)
             for layer_idx in range(self.layers):
                 to_quant_key_states = self.key_states_full[layer_idx][:, :, :to_quant_len].clone()
-                self.key_states_full[layer_idx][:, :, :-to_quant_len] = self.key_states_full[layer_idx][:, :, to_quant_len:]
+                self.key_states_full[layer_idx][:, :, :-to_quant_len] = self.key_states_full[layer_idx][:, :, to_quant_len:].clone()
                 
                 key_states_quant_trans_new, key_scale_trans_new, key_mn_trans_new = triton_quantize_and_pack_along_last_dim(
                     to_quant_key_states.transpose(2,3).contiguous(), self.group_size, self.k_bits
@@ -323,8 +466,7 @@ class QCache(Cache):
             to_quant_len = full_val_len-self.residual_length
             for layer_idx in range(self.layers):
                 value_states_full = self.value_states_full[layer_idx][:, :, :to_quant_len].clone()
-                self.value_states_full[layer_idx][:, :, :-(to_quant_len)] = self.value_states_full[layer_idx][:, :, to_quant_len:].contiguous()
-                
+                self.value_states_full[layer_idx][:, :, :-(to_quant_len)] = self.value_states_full[layer_idx][:, :, to_quant_len:].clone().contiguous()
                 value_states_quant_new, value_scale_new, value_mn_new = triton_quantize_and_pack_along_last_dim(
                     value_states_full.contiguous(), self.group_size, self.v_bits
                 )
