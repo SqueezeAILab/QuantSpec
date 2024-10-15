@@ -370,13 +370,10 @@ class LlamaFlashAttention2_KIVI445(LlamaAttention_KIVI445):
                         f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
                         f" {attn_weights.size()}"
                     )
-
-                if attention_mask is not None:
-                    if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                        raise ValueError(
-                            f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                        )
-                    attn_weights = attn_weights + attention_mask
+                
+                if attention_mask is not None:  # no matter the length, we just slice it
+                    causal_mask = attention_mask[:, :, :, : kv_seq_len]
+                    attn_weights = attn_weights + causal_mask
                     attn_weights = torch.max(
                         attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min)
                     )
@@ -442,7 +439,7 @@ class LlamaFlashAttention2_KIVI445(LlamaAttention_KIVI445):
             query_states,
             key_states,
             value_states,
-            attention_mask,
+            None, # (TODO) replace with padding mask
             q_len,
             position_ids=position_ids,
             dropout=dropout_rate,
@@ -611,10 +608,10 @@ class LlamaModel_KIVI445(LlamaPreTrainedModel_KIVI445):
         kv_cache: Cache,
         output_attentions: bool,
     ):
-        if self.config._attn_implementation == "flash_attention_2":
-            if attention_mask is not None and 0.0 in attention_mask:
-                return attention_mask
-            return None
+        # if self.config._attn_implementation == "flash_attention_2":
+        #     if attention_mask is not None and 0.0 in attention_mask:
+        #         return attention_mask
+        #     return None
 
         # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
         # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
@@ -687,6 +684,8 @@ class LlamaModel_KIVI445(LlamaPreTrainedModel_KIVI445):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
+        
+        assert attention_mask is None, "Padding mask is not supported"
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

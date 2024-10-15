@@ -33,7 +33,7 @@ def parse_arguments():
     parser.add_argument('--v_bits', type=int, default=4, help='v_bits')
     parser.add_argument('--group_size', type=int, default=32, help='group_size')
     parser.add_argument('--residual_length', type=int, default=32, help='residual_length')
-    parser.add_argument('--attn', type=str, default='eager', help='attn implementation')
+    parser.add_argument('--attn', type=str, default='flash_attention_2', help='attention implementation')
 
     parser.add_argument('--target', type=str, default='meta-llama/Meta-Llama-3.1-8B', help='target model')
     parser.add_argument('--draft', type=str, default='meta-llama/Meta-Llama-3.1-8B', help='draft model')

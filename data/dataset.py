@@ -70,6 +70,24 @@ def get_dataset(dataset_name, tokenizer=None, datalen=None, task=None):
                 continue
             tokenized_prompts.append(tokenized_prompt)
         return tokenized_prompts
-
+    
+    elif dataset_name == 'wikitext2':
+        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test", cache_dir='/rscratch/rishabhtiwari/cache/')
+        tokenized_prompts = []
+        tokenized_prompts.append(tokenizer.encode("\n\n".join(dataset['text']), return_tensors="pt"))
+        return tokenized_prompts
+    
+    elif dataset_name == "c4":
+        tokenized_prompts = []
+        dataset = load_dataset(
+            "allenai/c4",
+            data_files={"validation": "en/c4-validation.00000-of-00008.json.gz"},
+            split="validation",
+            use_auth_token=False,
+            cache_dir='/rscratch/rishabhtiwari/cache/'
+        )
+        tokenized_prompts.append(tokenizer.encode(" ".join(dataset[0:1100]['text']), return_tensors="pt")[:, :(256*datalen)])
+        return tokenized_prompts
+    
     else:
         raise Exception("Dataset not found")
