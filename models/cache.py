@@ -69,8 +69,12 @@ class SimUniformDynamicCache(Cache):
         self.value_states.zero_()
     
     def update(self, key_states, value_states, layer_idx):
-        self.key_states[layer_idx][:, :, self.seq_len : self.seq_len + key_states.shape[-2]] = key_states
-        self.value_states[layer_idx][:, :, self.seq_len : self.seq_len + value_states.shape[-2]] = value_states
+        try:
+            self.key_states[layer_idx][:, :, self.seq_len : self.seq_len + key_states.shape[-2]] = key_states
+            self.value_states[layer_idx][:, :, self.seq_len : self.seq_len + value_states.shape[-2]] = value_states
+        except:
+            import IPython
+            IPython.embed()
         # print(key_states.shape, value_states.shape)
 
         output = (
@@ -371,7 +375,7 @@ class SimQCache(Cache):
 
 
 class QCache(Cache):
-    def __init__(self, model, max_budget=1024) -> None:
+    def __init__(self, model, max_budget=1024, variation='0') -> None:
         self.seq_len = 0
         self.quant_key_len = 0
         self.quant_val_len = 0
@@ -381,7 +385,7 @@ class QCache(Cache):
         self.k_bits = model.config.k_bits
         self.v_bits = model.config.v_bits
         self.max_budget = max_budget
-
+        self.variation = variation
         self.hidden_size = model.config.hidden_size
         self.num_heads = model.config.num_key_value_heads
         self.head_dim = self.hidden_size // model.config.num_attention_heads
@@ -463,7 +467,15 @@ class QCache(Cache):
         full_val_len = self.seq_len - self.quant_val_len
         if full_val_len > self.residual_length:
             assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
-            to_quant_len = full_val_len-self.residual_length
+            if self.variation == '0':
+                to_quant_len = full_val_len-self.residual_length
+            elif self.variation == '1':
+                to_quant_len = full_key_len-(full_key_len%self.residual_length)
+            elif self.variation == '2':
+                to_quant_len = full_val_len-self.residual_length//2-(full_val_len%(self.residual_length//2))
+            else:
+                raise ValueError(f"Invalid variation: {self.variation}")
+            
             for layer_idx in range(self.layers):
                 value_states_full = self.value_states_full[layer_idx][:, :, :to_quant_len].clone()
                 self.value_states_full[layer_idx][:, :, :-(to_quant_len)] = self.value_states_full[layer_idx][:, :, to_quant_len:].clone().contiguous()

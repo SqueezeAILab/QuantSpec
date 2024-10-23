@@ -160,6 +160,7 @@ def SimQuantSpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, to
                 # if eos
                 if tokenizer.eos_token_id == i:
                     draft_count -= gamma - count
+                    print("EOS"*20, flush=True)
                     break
             else:
                 resample_count += 1
@@ -169,8 +170,8 @@ def SimQuantSpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, to
                     spec_stream(pred_token_idx, tokenizer, 'red')
                 break
 
-            if tokenizer.eos_token_id == pred_token_idx:
-                break
+            # if tokenizer.eos_token_id == pred_token_idx:
+            #     break
         
         spec_engine.engine.target_cache.seq_len -= (gamma - count)
         spec_engine.engine.draft_cache.seq_len -= max(0,(gamma - count - 1))

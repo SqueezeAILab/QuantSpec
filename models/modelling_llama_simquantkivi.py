@@ -54,7 +54,7 @@ from transformers.utils import (
 from quant_kivi.new_pack import triton_quantize_and_pack_along_last_dim
 from quant_kivi.matmul import cuda_bmm_fA_qB_outer, triton_bmm_fA_qB_outer
 import math
-
+import numpy as np
 
 logger = logging.get_logger(__name__)
 
@@ -77,6 +77,24 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
+import torch.nn.functional as F
+class LinearAct(nn.Linear):
+    def __init__(self, inp, out, bias=False):
+        self.act = None
+        self.inp_feature = inp
+        self.out_feature = out
+        self.retain_grad = False
+        super().__init__(inp, out, bias=bias)
+
+    def forward(self, x):
+        inshape = x.shape
+        x.requires_grad_(True)
+        y = F.linear(x, self.weight, self.bias)
+        if self.retain_grad:
+            y.retain_grad()
+        self.act = y
+        return y
+
 class LlamaAttention_KIVI445(LlamaAttention):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
     def __init__(self, *args, **kwargs):
@@ -84,6 +102,45 @@ class LlamaAttention_KIVI445(LlamaAttention):
         self.group_size = self.config.group_size
         self.k_bits = self.config.k_bits
         self.v_bits = self.config.v_bits
+        # self.q_proj = LinearAct(self.hidden_size, self.num_heads * self.head_dim, bias=self.config.attention_bias)
+        self.k_proj = LinearAct(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=self.config.attention_bias)
+        self.v_proj = LinearAct(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=self.config.attention_bias)
+        self.o_proj = LinearAct(self.num_heads * self.head_dim, self.hidden_size, bias=self.config.attention_bias)
+        if self.config.grads is not None:
+
+            k_grad_mag = self.config.grads[f'k_proj{self.layer_idx}']
+            v_grad_mag = self.config.grads[f'v_proj{self.layer_idx}']
+            k_threshold = self.config.k_threshold
+            v_threshold = self.config.v_threshold
+
+            k_factors = []
+            v_factors = []
+            for i in range(self.num_heads):
+                sensitivity = np.mean(k_grad_mag) if self.config.per_layer_threshold else k_grad_mag[i//self.num_key_value_groups]
+                if sensitivity<k_threshold:
+                    if self.k_bits == 8:
+                        k_factors.append(17*5)
+                    elif self.k_bits == 4:
+                        k_factors.append(5)
+                    else:
+                        k_factors.append(1)
+                else:
+                    k_factors.append(1)
+                sensitivity = np.mean(v_grad_mag) if self.config.per_layer_threshold else v_grad_mag[i//self.num_key_value_groups]
+                if sensitivity<v_threshold:
+                    if self.v_bits == 8:
+                        v_factors.append(17*5)
+                    elif self.v_bits == 4:
+                        v_factors.append(5)
+                    else:
+                        v_factors.append(1)
+                else:
+                    v_factors.append(1)
+            self.k_factors = torch.tensor(k_factors).cuda()
+            self.v_factors = torch.tensor(v_factors).cuda()
+        else:
+            self.k_factors = None
+            self.v_factors = None
     
     def forward(
         self,
@@ -159,7 +216,7 @@ class LlamaAttention_KIVI445(LlamaAttention):
  
             if key_states_quant_trans is not None:
                 att_qkquant = sim_cuda_bmm_fA_qB_outer(self.group_size, query_states, key_states_quant_trans, 
-                                key_scale_trans, key_mn_trans, self.k_bits)
+                                key_scale_trans, key_mn_trans, self.k_bits, self.k_factors)
             else:
                 att_qkquant = None
             att_qkfull = torch.matmul(query_states, key_states_full.transpose(2, 3))
@@ -190,7 +247,7 @@ class LlamaAttention_KIVI445(LlamaAttention):
                 attn_output = torch.matmul(attn_weights, value_states_full)
             else:
                 attn_output = sim_cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, :-value_full_length], value_states_quant, 
-                                                value_scale, value_mn, self.v_bits)
+                                                value_scale, value_mn, self.v_bits, self.v_factors)
                 attn_output += torch.matmul(attn_weights[:, :, :, -value_full_length:], value_states_full)
             attn_output = attn_output.transpose(1, 2).contiguous()
             attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
@@ -251,20 +308,40 @@ class LlamaAttention_KIVI445(LlamaAttention):
 #     out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 #     return out.to(torch.float16)
 
-def sim_cuda_bmm_fA_qB_outer(group_size, fA, qB, scale, mn, bits):
+# def sim_cuda_bmm_fA_qB_outer(group_size, fA, qB, scale, mn, bits):
+#     # fA is of shape (B, nh, M, K) float16
+# 	# qB is of shape (B, nh, K, N) int32
+#     # scales is of shape (B, nh, K, G) float16
+# 	# zeros is of shape (B, nh, K, G) float16
+#     # bits: int
+#     num_groups = qB.size(-1) // group_size
+#     B = qB.reshape(*qB.shape[:-1], num_groups, group_size)*scale.unsqueeze(-1)+ mn.unsqueeze(-1)
+#     B = B.reshape(*qB.shape[:-1], -1)
+#     out = torch.matmul(fA, B)
+#     out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+#     return out
+
+def sim_cuda_bmm_fA_qB_outer(group_size, fA, qB, scale, mn, bits, factors):
     # fA is of shape (B, nh, M, K) float16
 	# qB is of shape (B, nh, K, N) int32
     # scales is of shape (B, nh, K, G) float16
 	# zeros is of shape (B, nh, K, G) float16
     # bits: int
+    # factors: (nh) float16
     num_groups = qB.size(-1) // group_size
-    B = qB.reshape(*qB.shape[:-1], num_groups, group_size)*scale.unsqueeze(-1)+ mn.unsqueeze(-1)
+    num_heads = qB.size(1)
+    B = qB.reshape(*qB.shape[:-1], num_groups, group_size).half()
+    if factors is not None:
+        factors = factors.view(1, num_heads, 1, 1, 1)
+        B = (B/factors).round()*factors
+    B = B*scale.unsqueeze(-1)+ mn.unsqueeze(-1)
     B = B.reshape(*qB.shape[:-1], -1)
     out = torch.matmul(fA, B)
     out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
     return out
 
-    
+
+
 
 class LlamaFlashAttention2_KIVI445(LlamaAttention_KIVI445):
     """
@@ -349,13 +426,11 @@ class LlamaFlashAttention2_KIVI445(LlamaAttention_KIVI445):
             value_scale = repeat_kv(past_key_value[6], self.num_key_value_groups)
             value_mn = repeat_kv(past_key_value[7], self.num_key_value_groups)
 
-
-
             if key_states_quant_trans is not None or value_states_quant is not None:
 
                 if key_states_quant_trans is not None:
                     att_qkquant = sim_cuda_bmm_fA_qB_outer(self.group_size, query_states, key_states_quant_trans, 
-                                    key_scale_trans, key_mn_trans, self.k_bits)
+                                    key_scale_trans, key_mn_trans, self.k_bits, self.k_factors)
                 else:
                     att_qkquant = None
 
@@ -387,7 +462,7 @@ class LlamaFlashAttention2_KIVI445(LlamaAttention_KIVI445):
                     attn_output = torch.matmul(attn_weights, value_states_full)
                 else:
                     attn_output = sim_cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, :-value_full_length], value_states_quant, 
-                                                    value_scale, value_mn, self.v_bits)
+                                                    value_scale, value_mn, self.v_bits, self.v_factors)
                     attn_output += torch.matmul(attn_weights[:, :, :, -value_full_length:], value_states_full)
                 attn_output = attn_output.transpose(1, 2).contiguous()
                 attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
