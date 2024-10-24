@@ -290,7 +290,41 @@ class SimQCache(Cache):
         self.value_scale.zero_()
         self.value_mn.zero_()
     
-    def update(self, key_states, value_states, layer_idx):
+    def update_and_quantize_packed(self, key_states, value_states, layer_idx, cache_kwargs):
+        full_key_len = key_states.shape[-2]
+        if full_key_len > self.residual_length:
+            assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
+            to_quant_len = full_key_len-(full_key_len%self.residual_length)
+            to_quant_key_states = key_states[:, :, :to_quant_len].clone()
+            self.key_states_full[layer_idx][:, :, :full_key_len-to_quant_len] = key_states[:, :, to_quant_len:].clone()
+            
+            
+            key_states_quant_trans_new, key_scale_trans_new, key_mn_trans_new = self.quantize_and_pack_along_last_dim(
+                to_quant_key_states.transpose(2,3).contiguous(), self.group_size, self.k_bits
+            )
+            self.key_states_quant_trans[layer_idx][:, :, :, self.quant_key_len:(self.quant_key_len+to_quant_len)] = key_states_quant_trans_new
+            self.key_scale_trans[layer_idx][:, :, :, self.quant_key_len//self.group_size:(self.quant_key_len+to_quant_len)//self.group_size] = key_scale_trans_new
+            self.key_mn_trans[layer_idx][:, :, :, self.quant_key_len//self.group_size:(self.quant_key_len+to_quant_len)//self.group_size] = key_mn_trans_new
+            if layer_idx == self.layers-1:
+                self.quant_key_len += to_quant_len
+
+        full_val_len = value_states.shape[-2]
+        if full_val_len > self.residual_length:
+            assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
+            to_quant_len = full_val_len-self.residual_length
+            value_states_full = self.value_states_full[layer_idx][:, :, :to_quant_len].clone()
+            self.value_states_full[layer_idx][:, :, :-(to_quant_len)] = self.value_states_full[layer_idx][:, :, to_quant_len:].clone().contiguous()
+            
+            value_states_quant_new, value_scale_new, value_mn_new = self.quantize_and_pack_along_last_dim(
+                value_states_full.contiguous(), self.group_size, self.v_bits
+            )
+            self.value_states_quant[layer_idx][:, :, self.quant_val_len:(self.quant_val_len+to_quant_len)] = value_states_quant_new.contiguous()
+            self.value_scale[layer_idx][:, :, self.quant_val_len:(self.quant_val_len+to_quant_len)] = value_scale_new
+            self.value_mn[layer_idx][:, :, self.quant_val_len:(self.quant_val_len+to_quant_len)] = value_mn_new
+            if layer_idx == self.layers-1:
+                self.quant_val_len += to_quant_len
+    
+    def update(self, key_states, value_states, layer_idx, cache_kwargs):
 
         self.key_states_full[layer_idx][:, :, self.seq_len-self.quant_key_len : self.seq_len - self.quant_key_len + key_states.shape[-2]] = key_states
         self.value_states_full[layer_idx][:, :, self.seq_len-self.quant_val_len : self.seq_len - self.quant_val_len + value_states.shape[-2]] = value_states

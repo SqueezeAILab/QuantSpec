@@ -61,8 +61,8 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "LlamaConfig"
 
 # 445 refers to transformers version 4.45.0
-class LlamaConfig_KIVI445(LlamaConfig):
-    model_type = "llama_kivi445"
+class LlamaConfig_SimQuant(LlamaConfig):
+    model_type = "llama_simquant"
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -95,52 +95,56 @@ class LinearAct(nn.Linear):
         self.act = y
         return y
 
-class LlamaAttention_KIVI445(LlamaAttention):
+class LlamaAttention_SimQuant(LlamaAttention):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.group_size = self.config.group_size
         self.k_bits = self.config.k_bits
         self.v_bits = self.config.v_bits
-        # self.q_proj = LinearAct(self.hidden_size, self.num_heads * self.head_dim, bias=self.config.attention_bias)
-        self.k_proj = LinearAct(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=self.config.attention_bias)
-        self.v_proj = LinearAct(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=self.config.attention_bias)
-        self.o_proj = LinearAct(self.num_heads * self.head_dim, self.hidden_size, bias=self.config.attention_bias)
-        if self.config.grads is not None:
+        
+        if self.config.calculate_sensitivity:
+            # modify the linear layers to retain gradients
+            self.k_proj = LinearAct(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=self.config.attention_bias) 
+            self.v_proj = LinearAct(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=self.config.attention_bias)
 
-            k_grad_mag = self.config.grads[f'k_proj{self.layer_idx}']
-            v_grad_mag = self.config.grads[f'v_proj{self.layer_idx}']
-            k_threshold = self.config.k_threshold
-            v_threshold = self.config.v_threshold
-
-            k_factors = []
-            v_factors = []
-            for i in range(self.num_heads):
-                sensitivity = np.mean(k_grad_mag) if self.config.per_layer_threshold else k_grad_mag[i//self.num_key_value_groups]
-                if sensitivity<k_threshold:
-                    if self.k_bits == 8:
-                        k_factors.append(17*5)
-                    elif self.k_bits == 4:
-                        k_factors.append(5)
-                    else:
-                        k_factors.append(1)
-                else:
-                    k_factors.append(1)
-                sensitivity = np.mean(v_grad_mag) if self.config.per_layer_threshold else v_grad_mag[i//self.num_key_value_groups]
-                if sensitivity<v_threshold:
-                    if self.v_bits == 8:
-                        v_factors.append(17*5)
-                    elif self.v_bits == 4:
-                        v_factors.append(5)
-                    else:
-                        v_factors.append(1)
-                else:
-                    v_factors.append(1)
-            self.k_factors = torch.tensor(k_factors).cuda()
-            self.v_factors = torch.tensor(v_factors).cuda()
+        if self.config.sensitivity is not None:
+            self.scale_factors_to_convert_to_higher_precision()
         else:
             self.k_factors = None
             self.v_factors = None
+    
+    def scale_factors_to_convert_to_higher_precision(self):
+        k_grad_mag = self.config.sensitivity[f'k_proj{self.layer_idx}']
+        v_grad_mag = self.config.sensitivity[f'v_proj{self.layer_idx}']
+        k_threshold = self.config.k_threshold
+        v_threshold = self.config.v_threshold
+
+        k_factors = []
+        v_factors = []
+        for i in range(self.num_heads):
+            sensitivity = np.mean(k_grad_mag) if self.config.per_layer_threshold else k_grad_mag[i//self.num_key_value_groups]
+            if sensitivity<k_threshold:
+                if self.k_bits == 8:
+                    k_factors.append(17*5)
+                elif self.k_bits == 4:
+                    k_factors.append(5)
+                else:
+                    k_factors.append(1)
+            else:
+                k_factors.append(1)
+            sensitivity = np.mean(v_grad_mag) if self.config.per_layer_threshold else v_grad_mag[i//self.num_key_value_groups]
+            if sensitivity<v_threshold:
+                if self.v_bits == 8:
+                    v_factors.append(17*5)
+                elif self.v_bits == 4:
+                    v_factors.append(5)
+                else:
+                    v_factors.append(1)
+            else:
+                v_factors.append(1)
+        self.k_factors = torch.tensor(k_factors).cuda()
+        self.v_factors = torch.tensor(v_factors).cuda()
     
     def forward(
         self,
@@ -201,9 +205,12 @@ class LlamaAttention_KIVI445(LlamaAttention):
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
         elif kv_cache is not None:
             ''' Our Logic Here '''
-
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             kv_seq_len = kv_cache.seq_len + q_len
-            past_key_value = kv_cache.update(key_states, value_states, layer_idx=self.layer_idx)
+            if kv_cache.seq_len == 0:
+                past_key_value = kv_cache.update_and_quantize_packed(key_states, value_states, layer_idx=self.layer_idx, cache_kwargs=cache_kwargs)
+            else:
+                past_key_value = kv_cache.update(key_states, value_states, layer_idx=self.layer_idx, cache_kwargs=cache_kwargs)
             key_states_quant_trans = repeat_kv(past_key_value[0], self.num_key_value_groups)
             key_states_full = repeat_kv(past_key_value[1], self.num_key_value_groups)
             key_scale_trans = repeat_kv(past_key_value[2], self.num_key_value_groups)
@@ -256,7 +263,7 @@ class LlamaAttention_KIVI445(LlamaAttention):
             if not output_attentions:
                 attn_weights = None
 
-            return attn_output, attn_weights, past_key_value
+            return attn_output, attn_weights, kv_cache
 
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -343,7 +350,7 @@ def sim_cuda_bmm_fA_qB_outer(group_size, fA, qB, scale, mn, bits, factors):
 
 
 
-class LlamaFlashAttention2_KIVI445(LlamaAttention_KIVI445):
+class LlamaFlashAttention2_SimQuant(LlamaAttention_SimQuant):
     """
     Llama flash attention module. This module inherits from `LlamaAttention` as the weights of the module stays
     untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
@@ -415,8 +422,10 @@ class LlamaFlashAttention2_KIVI445(LlamaAttention_KIVI445):
         elif kv_cache is not None:
             ''' Our Logic Here '''
 
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+
             kv_seq_len = kv_cache.seq_len + q_len
-            past_key_value = kv_cache.update(key_states, value_states, layer_idx=self.layer_idx)
+            past_key_value = kv_cache.update_and_quantize_packed(key_states, value_states, layer_idx=self.layer_idx, cache_kwargs=cache_kwargs)
             key_states_quant_trans = repeat_kv(past_key_value[0], self.num_key_value_groups)
             key_states_full = repeat_kv(past_key_value[1], self.num_key_value_groups)
             key_scale_trans = repeat_kv(past_key_value[2], self.num_key_value_groups)
@@ -471,7 +480,7 @@ class LlamaFlashAttention2_KIVI445(LlamaAttention_KIVI445):
                 if not output_attentions:
                     attn_weights = None
 
-                return attn_output, attn_weights, past_key_value
+                return attn_output, attn_weights, kv_cache
             else:
                 key_states = key_states_full
                 value_states = value_states_full
@@ -528,11 +537,11 @@ class LlamaFlashAttention2_KIVI445(LlamaAttention_KIVI445):
 
         if not output_attentions:
             attn_weights = None
+    
+        return attn_output, attn_weights, kv_cache if kv_cache is not None else past_key_value
 
-        return attn_output, attn_weights, past_key_value
 
-
-class LlamaSdpaAttention_KIVI445(LlamaAttention_KIVI445):
+class LlamaSdpaAttention_SimQuant(LlamaAttention_SimQuant):
     """
     Llama attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
     `LlamaAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
@@ -543,13 +552,13 @@ class LlamaSdpaAttention_KIVI445(LlamaAttention_KIVI445):
 
 
 LLAMA_ATTENTION_SIMQUANT445_CLASSES = {
-    "eager": LlamaAttention_KIVI445,
-    "flash_attention_2": LlamaFlashAttention2_KIVI445,
-    "sdpa": LlamaSdpaAttention_KIVI445,
+    "eager": LlamaAttention_SimQuant,
+    "flash_attention_2": LlamaFlashAttention2_SimQuant,
+    "sdpa": LlamaSdpaAttention_SimQuant,
 }
 
 
-class LlamaDecoderLayer_KIVI445(LlamaDecoderLayer):
+class LlamaDecoderLayer_SimQuant(LlamaDecoderLayer):
     def __init__(self, config: LlamaConfig, layer_idx):
         super().__init__(config, layer_idx=layer_idx)
         self.hidden_size = config.hidden_size
@@ -635,31 +644,31 @@ class LlamaDecoderLayer_KIVI445(LlamaDecoderLayer):
         return outputs
 
 
-class LlamaPreTrainedModel_KIVI445(LlamaPreTrainedModel):
-    config_class = LlamaConfig_KIVI445
+class LlamaPreTrainedModel_SimQuant(LlamaPreTrainedModel):
+    config_class = LlamaConfig_SimQuant
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["LlamaDecoderLayer_KIVI445"]
+    _no_split_modules = ["LlamaDecoderLayer_SimQuant"]
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True
 
 
-class LlamaModel_KIVI445(LlamaPreTrainedModel_KIVI445):
+class LlamaModel_SimQuant(LlamaPreTrainedModel_SimQuant):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
 
     Args:
-        config: LlamaConfig_KIVI445
+        config: LlamaConfig_SimQuant
     """
 
-    def __init__(self, config: LlamaConfig_KIVI445):
+    def __init__(self, config: LlamaConfig_SimQuant):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayer_KIVI445(config, layer_idx=layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [LlamaDecoderLayer_SimQuant(config, layer_idx=layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
@@ -880,12 +889,12 @@ class LlamaModel_KIVI445(LlamaPreTrainedModel_KIVI445):
         )
 
 
-class LlamaForCausalLM_KIVI445(LlamaPreTrainedModel_KIVI445):
+class LlamaForCausalLM_SimQuant(LlamaPreTrainedModel_SimQuant):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = LlamaModel_KIVI445(config)
+        self.model = LlamaModel_SimQuant(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.forward_step_id = 0
@@ -1019,6 +1028,6 @@ class LlamaForCausalLM_KIVI445(LlamaPreTrainedModel_KIVI445):
             attentions=outputs.attentions,
         )
 
-AutoConfig.register("llama_kivi445", LlamaConfig_KIVI445)
-AutoModel.register(LlamaConfig_KIVI445, LlamaModel_KIVI445)
-AutoModelForCausalLM.register(LlamaConfig_KIVI445, LlamaForCausalLM_KIVI445)
+AutoConfig.register("llama_simquant", LlamaConfig_SimQuant)
+AutoModel.register(LlamaConfig_SimQuant, LlamaModel_SimQuant)
+AutoModelForCausalLM.register(LlamaConfig_SimQuant, LlamaForCausalLM_SimQuant)

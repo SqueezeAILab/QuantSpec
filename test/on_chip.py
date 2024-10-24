@@ -10,8 +10,7 @@ from transformers import AutoTokenizer
 from termcolor import colored
 from tqdm import tqdm
 from data.dataset import get_dataset
-from models.modeling_llama_simquant445 import LlamaForCausalLM_Simquant445
-from models.modelling_llama_simquantkivi import LlamaForCausalLM_KIVI445 as LlamaForCausalLM_SimKIVI445
+from models.modelling_llama_simquantkivi import LlamaForCausalLM_SimQuant
 from models.cache import SimUniformDynamicCache, SimNonUniformCache, QCache, SimQCache
 from utils.decoding import SpecDecode, SimQuantSpecDecode
 from utils.misc import print_config, log_csv, seed_everything
@@ -27,10 +26,8 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='args for main.py')
     parser.add_argument('--cache_dir', type=str, default='/rscratch/rishabhtiwari/cache/')
     parser.add_argument('--quantized_draft', action='store_true', help='whether to use quantized draft')
-    parser.add_argument('--nuq', action='store_true', help='whether to use nuq')
     parser.add_argument('--simquant', action='store_true', help='whether to use simulated quantization')
-    parser.add_argument('--k_bits', type=int, default=4, help='k_bits')
-    parser.add_argument('--v_bits', type=int, default=4, help='v_bits')
+    parser.add_argument('--bits', type=int, default=4, help='k_bits')
     parser.add_argument('--group_size', type=int, default=32, help='group_size')
     parser.add_argument('--residual_length', type=int, default=32, help='residual_length')
     parser.add_argument('--attn', type=str, default='flash_attention_2', help='attention implementation')
@@ -58,17 +55,18 @@ if __name__ == "__main__":
 
     config = LlamaConfig.from_pretrained(args.draft)
     config.use_cache = False
-    config.k_bits = args.k_bits # KiVi currently support 2/4 K/V bits
-    config.v_bits = args.v_bits
+    config.bits = args.bits # currently only support 4-bit
     config.group_size = args.group_size 
     config.use_cache = False
     config._attn_implementation = args.attn
     config.residual_length = args.residual_length # corresponding to the number of recent fp16 tokens
     CACHE_DIR = args.cache_dir
     if args.simquant:
-        draft_class = LlamaForCausalLM_SimKIVI445
+        draft_class = LlamaForCausalLM_SimQuant
+        target_class = LlamaForCausalLM_SimQuant
     else:
         draft_class = LlamaForCausalLM_KIVI445
+        target_class = LlamaForCausalLM_KIVI445
     draft = draft_class.from_pretrained(
     pretrained_model_name_or_path=args.draft,
     config=config,
@@ -77,7 +75,7 @@ if __name__ == "__main__":
     device_map="cuda:0"
     )
     
-    target = LlamaForCausalLM_Simquant445.from_pretrained(
+    target = target_class.from_pretrained(
     pretrained_model_name_or_path=args.target,
     config=config,
     cache_dir=CACHE_DIR,
@@ -112,18 +110,12 @@ if __name__ == "__main__":
     print_config(draft, target, args.dataset, prefill, gen_len, gamma, top_k, top_p, temperature, args.quantized_draft, args.k_bits, args.v_bits, args.group_size, args.residual_length)
 
     ####### cache init #######
-    if args.nuq:
-        assert args.k_bits == 4 and args.v_bits == 4, "NuQ only supports 4-bit K/V"
-        with open('/rscratch/rishabhtiwari/QuantSpec/quant_kivi/kvquant/quantizers.pickle', 'rb') as f:
-            quantizers = pickle.load(f)
-        draft_cache = SimNonUniformCache(draft, quantizers, max_budget=prefill+gen_len+16)
-        target_cache = SimNonUniformCache(target, quantizers, max_budget=prefill+gen_len+16)
-    elif args.simquant:
+    if args.simquant:
         draft_cache = SimQCache(draft, max_budget=prefill+gen_len+16)
-        target_cache = SimUniformDynamicCache(target, max_budget=prefill+gen_len+16)
+        target_cache = SimQCache(target, max_budget=prefill+gen_len+16)
     else:
-        draft_cache = QCache(draft, max_budget=prefill+gen_len+16)
-        target_cache = SimUniformDynamicCache(target, max_budget=prefill+gen_len+16)
+        target_cache = QCache(target, max_budget=prefill+gen_len+16)
+        draft_cache = target_cache
     
     spec_engine = GraphInferenceEngine(target, target_cache, draft, draft_cache)
 
