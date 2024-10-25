@@ -27,7 +27,8 @@ def parse_arguments():
     parser.add_argument('--cache_dir', type=str, default='/rscratch/rishabhtiwari/cache/')
     parser.add_argument('--quantized_draft', action='store_true', help='whether to use quantized draft')
     parser.add_argument('--simquant', action='store_true', help='whether to use simulated quantization')
-    parser.add_argument('--bits', type=int, default=4, help='k_bits')
+    parser.add_argument('--k_bits', type=int, default=4, help='k_bits')
+    parser.add_argument('--v_bits', type=int, default=4, help='v_bits')
     parser.add_argument('--group_size', type=int, default=32, help='group_size')
     parser.add_argument('--residual_length', type=int, default=32, help='residual_length')
     parser.add_argument('--attn', type=str, default='flash_attention_2', help='attention implementation')
@@ -55,7 +56,8 @@ if __name__ == "__main__":
 
     config = LlamaConfig.from_pretrained(args.draft)
     config.use_cache = False
-    config.bits = args.bits # currently only support 4-bit
+    config.k_bits = args.k_bits # currently only support 4-bit
+    config.v_bits = args.v_bits # currently only support 4-bit
     config.group_size = args.group_size 
     config.use_cache = False
     config._attn_implementation = args.attn
@@ -104,8 +106,6 @@ if __name__ == "__main__":
     gen_len = args.gen_len
     gamma = args.gamma
     verbose = args.verbose
-    # chunk_size = args.chunk_size
-    # max_budget = args.budget
     log_file = args.log_file
     print_config(draft, target, args.dataset, prefill, gen_len, gamma, top_k, top_p, temperature, args.quantized_draft, args.k_bits, args.v_bits, args.group_size, args.residual_length)
 
