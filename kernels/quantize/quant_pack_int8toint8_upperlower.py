@@ -30,7 +30,7 @@ def triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_l
 							 BLOCK_SIZE_N=BLOCK_SIZE_N, num_warps=8) 
 
 	scale = (mx - mn) / (2 ** bit - 1)
-	scale_lower = scale / (2 ** bit - 1)
+	scale_lower = scale / (2 ** bit)
 	data_upper = data - mn.unsqueeze(1)
 	data_upper.div_(scale.unsqueeze(1))
 	data_upper = data_upper.clamp_(0, 2 ** bit - 1).round_().to(torch.int8)

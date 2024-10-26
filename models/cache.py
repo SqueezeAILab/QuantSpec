@@ -426,8 +426,8 @@ class QCache(Cache, torch.nn.Module):
                 to_quant_len = prefill_len-self.residual_length-(prefill_len%self.residual_length)
                 if prefill_len-to_quant_len > 0:
 
-                    self.full_key_cache[layer_idx][:, :, :prefill_len-to_quant_len].copy_(key_states[:, :, to_quant_len:])
-                    self.full_value_cache[layer_idx][:, :, :prefill_len-to_quant_len].copy_(value_states[:, :, to_quant_len:])
+                    self.full_key_cache[layer_idx][:, :, :prefill_len-to_quant_len].copy_(key_states[:, :, to_quant_len:].clone())
+                    self.full_value_cache[layer_idx][:, :, :prefill_len-to_quant_len].copy_(value_states[:, :, to_quant_len:].clone())
 
                 key_states_quant_ubits, key_states_quant_lbits, key_scale, key_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(key_states[:, :, :to_quant_len], self.group_size, self.k_bits)
                 value_states_quant_ubits, value_states_quant_lbits, value_scale, value_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(value_states[:, :, :to_quant_len].transpose(2,3).contiguous(), self.group_size, self.v_bits)
@@ -491,7 +491,7 @@ class QCache(Cache, torch.nn.Module):
             to_quant_len = full_val_len-self.residual_length-(full_val_len%self.residual_length)
             for layer_idx in range(self.layers-self.first_few_fp16_layers):
                 to_quant_value_states = self.full_value_cache[layer_idx][:, :, :to_quant_len]
-                value_states_quant_ubits, value_states_quant_lbits, value_scale, value_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(to_quant_value_states.transpose(2,3), self.group_size, self.v_bits)
+                value_states_quant_ubits, value_states_quant_lbits, value_scale, value_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(to_quant_value_states.transpose(2,3).contiguous(), self.group_size, self.v_bits)
                 self.full_value_cache[layer_idx][:, :, :full_val_len-to_quant_len].copy_(self.full_value_cache[layer_idx][:, :, to_quant_len:full_val_len].clone())
 
                 self.trans_quantize_value_cache_ubits[layer_idx][:, :, :, self.quant_val_len//(8//self.v_bits):(self.quant_val_len+to_quant_len)//(8//self.v_bits)].copy_(value_states_quant_ubits)

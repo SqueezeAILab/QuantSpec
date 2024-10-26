@@ -94,7 +94,7 @@ def _fwd_kernel_int8kv_upperlower_flash_decode_stage1(
         low_k_int8_high = ((quant_k_lower & 0xF0) >> 4)
         low_k = tl.interleave(low_k_int8_low, low_k_int8_high)
 
-        low_scale_k = scale_k / (2 ** kbit - 1)
+        low_scale_k = scale_k / (2 ** kbit)
 
         # tl.static_print(scale_k, min_k)
 
@@ -129,7 +129,7 @@ def _fwd_kernel_int8kv_upperlower_flash_decode_stage1(
         low_v_int8_high = ((quant_v_lower & 0xF0) >> 4)
         low_v = tl.interleave(low_v_int8_low, low_v_int8_high).to(tl.float16)
 
-        low_scale_v = scale_v / (2 ** vbit - 1)
+        low_scale_v = scale_v / (2 ** vbit)
 
         # v = tl.reshape(v, (BLOCK_DMODEL // group_size, group_size, BLOCK_N))
         # scale_v = tl.reshape(scale_v, (BLOCK_DMODEL // group_size, 1, BLOCK_N))
