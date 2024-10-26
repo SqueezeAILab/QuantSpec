@@ -12,12 +12,11 @@ from tqdm import tqdm
 from data.dataset import get_dataset
 from models.modelling_llama_simquantkivi import LlamaForCausalLM_SimQuant
 from models.cache import QCache, SimQCacheV2
-from utils.decoding import SpecDecode, SimQuantSpecDecode
+from utils.decoding import SimQuantSpecDecode
 from utils.misc import print_config, log_csv, seed_everything
 from utils.graph_infer import GraphInferenceEngine
 from transformers import AutoTokenizer, LlamaConfig
 from models.modelling_llama_kivi  import LlamaForCausalLM_KIVI445
-import pickle
 import numpy as np
 import copy
 seed_everything(43)
@@ -74,7 +73,7 @@ if __name__ == "__main__":
     config._attn_implementation = args.attn
     config.residual_length = args.residual_length # corresponding to the number of recent fp16 tokens
     
-    config.mixed_precision = None
+    config.mixed_precision = None if not args.mixed_precision else args.mixed_precision
 
     target_config = copy.deepcopy(config)
 
@@ -138,7 +137,7 @@ if __name__ == "__main__":
     target_config.first_few_fp16_layers = config.num_hidden_layers
     target = target_class.from_pretrained(
     pretrained_model_name_or_path=args.target,
-    config=config,
+    config=target_config,
     cache_dir=CACHE_DIR,
     torch_dtype=torch.float16,
     device_map="cuda:0"
@@ -184,7 +183,7 @@ if __name__ == "__main__":
     print(colored(f"tokenized_prompts length: {len(tokenized_prompts)}", "green"))
 
 
-    decoding_fn = SimQuantSpecDecode if args.quantized_draft else SpecDecode
+    decoding_fn = SimQuantSpecDecode
 
     log_csv(log_file, "average_acceptance_rate, acceptance_rate_list, average_latency\n", f"{args.identifier_string}, {args.dataset}, {args.prefill}, {args.k_bits}, {args.v_bits}, {args.group_size}\n")
 

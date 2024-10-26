@@ -220,11 +220,11 @@ class LlamaAttention_SimQuant(LlamaAttention):
 
             value_full_length = value_states_full.shape[-2]
 
-            if value_states_quant is None:
+            if trans_value_scale is None:
                 attn_output = torch.matmul(attn_weights, value_states_full)
             else:
-                attn_output = sim_cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, :-value_full_length], value_states_quant, 
-                                                value_scale, value_mn, self.v_bits, self.v_factors)
+                attn_output = sim_cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, :-value_full_length], trans_value_states_quant_ubits.transpose(2, 3), trans_value_states_quant_lbits.transpose(2, 3), 
+                                                trans_value_scale.transpose(2, 3), trans_value_min.transpose(2, 3), self.v_bits, self.v_mixed_bits)
                 attn_output += torch.matmul(attn_weights[:, :, :, -value_full_length:], value_states_full)
             attn_output = attn_output.transpose(1, 2).contiguous()
             attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
@@ -271,32 +271,6 @@ class LlamaAttention_SimQuant(LlamaAttention):
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
-    
-# def sim_cuda_bmm_fA_qB_outer(group_size, fA, qB, scale, mn, bits):
-#     # fA is of shape (B, nh, M, K) float16
-# 	# qB is of shape (B, nh, K, N) int32
-#     # scales is of shape (B, nh, K, G) float16
-# 	# zeros is of shape (B, nh, K, G) float16
-#     # bits: int
-#     num_groups = qB.size(-1) // group_size
-#     B = qB.reshape(*qB.shape[:-1], num_groups, group_size).to(torch.float32)*scale.to(torch.float32).unsqueeze(-1) + mn.to(torch.float32).unsqueeze(-1)
-#     B = B.reshape(*qB.shape[:-1], -1)
-#     out = torch.matmul(fA.to(torch.float32), B)
-#     out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-#     return out.to(torch.float16)
-
-# def sim_cuda_bmm_fA_qB_outer(group_size, fA, qB, scale, mn, bits):
-#     # fA is of shape (B, nh, M, K) float16
-# 	# qB is of shape (B, nh, K, N) int32
-#     # scales is of shape (B, nh, K, G) float16
-# 	# zeros is of shape (B, nh, K, G) float16
-#     # bits: int
-#     num_groups = qB.size(-1) // group_size
-#     B = qB.reshape(*qB.shape[:-1], num_groups, group_size)*scale.unsqueeze(-1)+ mn.unsqueeze(-1)
-#     B = B.reshape(*qB.shape[:-1], -1)
-#     out = torch.matmul(fA, B)
-#     out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-#     return out
 
 def sim_cuda_bmm_fA_qB_outer(group_size, fA, quB, qlB, scale, mn, bits, mixed_bits):
     # fA is of shape (B, nh, M, K) float16
@@ -310,11 +284,15 @@ def sim_cuda_bmm_fA_qB_outer(group_size, fA, quB, qlB, scale, mn, bits, mixed_bi
     num_heads = quB.size(1)
     Bu = quB.reshape(*quB.shape[:-1], num_groups, group_size)
     Bl = qlB.reshape(*qlB.shape[:-1], num_groups, group_size)
-    if mixed_bits is not None:
-        factors = factors.view(1, num_heads, 1, 1, 1)
-        B = (B/factors).round()*factors
-    B = B*scale.unsqueeze(-1)+ mn.unsqueeze(-1)
-    B = B.reshape(*qB.shape[:-1], -1)
+
+    B = Bu*scale.unsqueeze(-1) + mn.unsqueeze(-1)
+    # TODO: implement mixed bits
+    if mixed_bits is not None: 
+        B = Bu*(2**bits) + Bl
+    else:
+        B = Bu*(2**bits)
+    B = B*scale.unsqueeze(-1)/(2**bits)+ mn.unsqueeze(-1)
+    B = B.reshape(*quB.shape[:-1], -1)
     out = torch.matmul(fA, B)
     out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
     return out
@@ -397,21 +375,26 @@ class LlamaFlashAttention2_SimQuant(LlamaAttention_SimQuant):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
 
             kv_seq_len = kv_cache.seq_len + q_len
-            past_key_value = kv_cache.update_and_quantize_packed(key_states, value_states, layer_idx=self.layer_idx, cache_kwargs=cache_kwargs)
-            key_states_quant_trans = repeat_kv(past_key_value[0], self.num_key_value_groups)
-            key_states_full = repeat_kv(past_key_value[1], self.num_key_value_groups)
-            key_scale_trans = repeat_kv(past_key_value[2], self.num_key_value_groups)
-            key_mn_trans = repeat_kv(past_key_value[3], self.num_key_value_groups)
-            value_states_quant = repeat_kv(past_key_value[4], self.num_key_value_groups)
+            past_key_value = kv_cache.update(key_states, value_states, layer_idx=self.layer_idx, cache_kwargs=cache_kwargs)
+
+            key_states_full = repeat_kv(past_key_value[0], self.num_key_value_groups)
+            key_states_quant_ubits = repeat_kv(past_key_value[1], self.num_key_value_groups)
+            key_states_quant_lbits = repeat_kv(past_key_value[2], self.num_key_value_groups)
+            key_scale = repeat_kv(past_key_value[3], self.num_key_value_groups)
+            key_min = repeat_kv(past_key_value[4], self.num_key_value_groups)
+
             value_states_full = repeat_kv(past_key_value[5], self.num_key_value_groups)
-            value_scale = repeat_kv(past_key_value[6], self.num_key_value_groups)
-            value_mn = repeat_kv(past_key_value[7], self.num_key_value_groups)
+            trans_value_states_quant_ubits = repeat_kv(past_key_value[6], self.num_key_value_groups)
+            trans_value_states_quant_lbits = repeat_kv(past_key_value[7], self.num_key_value_groups)
+            trans_value_scale = repeat_kv(past_key_value[8], self.num_key_value_groups)
+            trans_value_min = repeat_kv(past_key_value[9], self.num_key_value_groups)
 
-            if key_states_quant_trans is not None or value_states_quant is not None:
 
-                if key_states_quant_trans is not None:
-                    att_qkquant = sim_cuda_bmm_fA_qB_outer(self.group_size, query_states, key_states_quant_trans, 
-                                    key_scale_trans, key_mn_trans, self.k_bits, self.k_factors)
+            if key_scale is not None or trans_value_scale is not None:
+
+                if key_scale is not None:
+                    att_qkquant = sim_cuda_bmm_fA_qB_outer(self.group_size, query_states, key_states_quant_ubits.transpose(2, 3), key_states_quant_lbits.transpose(2, 3), 
+                                key_scale.transpose(2, 3), key_min.transpose(2, 3), self.k_bits, self.k_mixed_bits)
                 else:
                     att_qkquant = None
 
@@ -439,11 +422,11 @@ class LlamaFlashAttention2_SimQuant(LlamaAttention_SimQuant):
 
                 value_full_length = value_states_full.shape[-2]
 
-                if value_states_quant is None:
+                if trans_value_scale is None:
                     attn_output = torch.matmul(attn_weights, value_states_full)
                 else:
-                    attn_output = sim_cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, :-value_full_length], value_states_quant, 
-                                                    value_scale, value_mn, self.v_bits, self.v_factors)
+                    attn_output = sim_cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, :-value_full_length], trans_value_states_quant_ubits.transpose(2, 3), trans_value_states_quant_lbits.transpose(2, 3), 
+                                                trans_value_scale.transpose(2, 3), trans_value_min.transpose(2, 3), self.v_bits, self.v_mixed_bits)
                     attn_output += torch.matmul(attn_weights[:, :, :, -value_full_length:], value_states_full)
                 attn_output = attn_output.transpose(1, 2).contiguous()
                 attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
