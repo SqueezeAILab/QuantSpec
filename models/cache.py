@@ -3,28 +3,9 @@ import torch
 from quant_kivi.new_pack import triton_quantize_and_pack_along_last_dim
 from transformers.cache_utils import Cache
 from transformers.configuration_utils import PretrainedConfig
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import List
 
 import math
-
-def round_to_nearest_pole_sim(w, poles):
-    """
-    w: weight/act values (1d vector)
-    poles: tuple of values
-
-    Round the numbers in w to the nearest value in poles.
-    """
-    stack = []
-    for c in poles:
-        diff = (w - c).abs()
-        stack.append(diff)
-    diff = torch.stack(stack)
-    idx = diff.argmin(axis=0)
-    aug = 0
-    for i, c in enumerate(poles):
-        aug += (idx == i) * c
-
-    return aug
 
 
 class SimQCacheV2(Cache):
@@ -35,6 +16,7 @@ class SimQCacheV2(Cache):
         self.k_bits = model.config.k_bits
         self.v_bits = model.config.v_bits
         self.residual_length = model.config.residual_length
+        self.first_few_fp16_layers = model.config.first_few_fp16_layers
 
         self.hidden_size = model.config.hidden_size
         self.num_key_value_heads = model.config.num_key_value_heads
@@ -43,11 +25,13 @@ class SimQCacheV2(Cache):
         self.device = model.device # TODO: change this to support multi-gpu
 
         # Full cache (residual) and quantized cache
+        self.full_key_cache_fp16: List[torch.Tensor] = []
+        self.full_value_cache_fp16: List[torch.Tensor] = []
         self.full_key_cache: List[torch.Tensor] = []
         self.full_value_cache: List[torch.Tensor] = []
-        self.quantize_key_cache_hbits: List[torch.Tensor] = []
+        self.quantize_key_cache_ubits: List[torch.Tensor] = []
         self.quantize_key_cache_lbits: List[torch.Tensor] = []
-        self.trans_quantize_value_cache_hbits: List[torch.Tensor] = []
+        self.trans_quantize_value_cache_ubits: List[torch.Tensor] = []
         self.trans_quantize_value_cache_lbits: List[torch.Tensor] = []
 
         # Zeropoint and Scale
@@ -60,6 +44,8 @@ class SimQCacheV2(Cache):
         self.qtype = torch.int32
 
         # Note: There will be significant perf decrease if switching to use 5D tensors instead.
+        fp16_full_key_cache_shape = (self.batch_size, self.num_key_value_heads, self.max_budget, self.head_dim)
+        fp16_full_value_cache_shape = (self.batch_size, self.num_key_value_heads, self.max_budget, self.head_dim)
         full_key_cache_shape = (self.batch_size, self.num_key_value_heads, self.residual_length, self.head_dim) # TODO: this part should be changed to support speculative decoding
         full_value_cache_shape = (self.batch_size, self.num_key_value_heads, self.residual_length, self.head_dim)
         quantize_key_cache_shape = (self.batch_size, self.num_key_value_heads, self.max_budget, self.head_dim)
@@ -71,52 +57,59 @@ class SimQCacheV2(Cache):
         trans_scale_value_cache_shape = (self.batch_size, self.num_key_value_heads, self.head_dim // self.group_size, self.max_budget)
 
         for idx in range(self.layers):
+            if idx < self.first_few_fp16_layers:
+                self.register_buffer(f"full_key_cache_{idx}", torch.zeros(fp16_full_key_cache_shape, dtype=torch.float16, device=self.device))
+                self.register_buffer(f"full_value_cache_{idx}", torch.zeros(fp16_full_value_cache_shape, dtype=torch.float16, device=self.device))
+                new_full_layer_key_cache = getattr(self, f"full_key_cache_{idx}")
+                new_full_layer_value_cache = getattr(self, f"full_value_cache_{idx}")
+                self.full_key_cache_fp16.append(new_full_layer_key_cache)
+                self.full_key_cache_fp16.append(new_full_layer_value_cache)
+            else:
+                self.register_buffer(f"full_key_cache_{idx}", torch.zeros(full_key_cache_shape, dtype=self.dtype, device=self.device))
+                self.register_buffer(f"full_value_cache_{idx}", torch.zeros(full_value_cache_shape, dtype=self.dtype, device=self.device))
+                self.register_buffer(f"quantize_key_cache_ubits{idx}", torch.zeros(quantize_key_cache_shape, dtype=self.qtype, device=self.device))
+                self.register_buffer(f"quantize_key_cache_lbits{idx}", torch.zeros(quantize_key_cache_shape, dtype=self.qtype, device=self.device))
+                self.register_buffer(f"trans_quantize_value_cache_ubits{idx}", torch.zeros(trans_quantize_value_cache_shape, dtype=self.qtype, device=self.device))
+                self.register_buffer(f"trans_quantize_value_cache_lbits{idx}", torch.zeros(trans_quantize_value_cache_shape, dtype=self.qtype, device=self.device))
 
-            self.register_buffer(f"full_key_cache_{idx}", torch.zeros(full_key_cache_shape, dtype=self.dtype, device=self.device))
-            self.register_buffer(f"full_value_cache_{idx}", torch.zeros(full_value_cache_shape, dtype=self.dtype, device=self.device))
-            self.register_buffer(f"quantize_key_cache_hbits{idx}", torch.zeros(quantize_key_cache_shape, dtype=self.qtype, device=self.device))
-            self.register_buffer(f"quantize_key_cache_lbits{idx}", torch.zeros(quantize_key_cache_shape, dtype=self.qtype, device=self.device))
-            self.register_buffer(f"trans_quantize_value_cache_hbits{idx}", torch.zeros(trans_quantize_value_cache_shape, dtype=self.qtype, device=self.device))
-            self.register_buffer(f"trans_quantize_value_cache_lbits{idx}", torch.zeros(trans_quantize_value_cache_shape, dtype=self.qtype, device=self.device))
+                self.register_buffer(f"min_key_cache_{idx}", torch.zeros(min_key_cache_shape, dtype=self.dtype, device=self.device))
+                self.register_buffer(f"trans_min_value_cache_{idx}", torch.zeros(trans_min_value_cache_shape, dtype=self.dtype, device=self.device))
+                self.register_buffer(f"scale_key_cache_{idx}", torch.zeros(scale_key_cache_shape, dtype=self.dtype, device=self.device))
+                self.register_buffer(f"trans_scale_value_cache_{idx}", torch.zeros(trans_scale_value_cache_shape, dtype=self.dtype, device=self.device))
+                new_full_layer_key_cache = getattr(self, f"full_key_cache_{idx}")
+                new_full_layer_value_cache = getattr(self, f"full_value_cache_{idx}")
+                new_quantize_layer_key_cache_ubits = getattr(self, f"quantize_key_cache_ubits{idx}")
+                new_quantize_layer_key_cache_lbits = getattr(self, f"quantize_key_cache_lbits{idx}")
+                new_trans_quantize_layer_value_cache_ubits = getattr(self, f"trans_quantize_value_cache_ubits{idx}")
+                new_trans_quantize_layer_value_cache_lbits = getattr(self, f"trans_quantize_value_cache_lbits{idx}")
+                new_min_layer_key_cache = getattr(self, f"min_key_cache_{idx}")
+                new_trans_min_layer_value_cache = getattr(self, f"trans_min_value_cache_{idx}")
+                new_scale_layer_key_cache = getattr(self, f"scale_key_cache_{idx}")
+                new_trans_scale_layer_value_cache = getattr(self, f"trans_scale_value_cache_{idx}")
 
-            self.register_buffer(f"min_key_cache_{idx}", torch.zeros(min_key_cache_shape, dtype=self.dtype, device=self.device))
-            self.register_buffer(f"trans_min_value_cache_{idx}", torch.zeros(trans_min_value_cache_shape, dtype=self.dtype, device=self.device))
-            self.register_buffer(f"scale_key_cache_{idx}", torch.zeros(scale_key_cache_shape, dtype=self.dtype, device=self.device))
-            self.register_buffer(f"trans_scale_value_cache_{idx}", torch.zeros(trans_scale_value_cache_shape, dtype=self.dtype, device=self.device))
-            new_full_layer_key_cache = getattr(self, f"full_key_cache_{idx}")
-            new_full_layer_value_cache = getattr(self, f"full_value_cache_{idx}")
-            new_quantize_layer_key_cache_hbits = getattr(self, f"quantize_key_cache_hbits{idx}")
-            new_quantize_layer_key_cache_lbits = getattr(self, f"quantize_key_cache_lbits{idx}")
-            new_trans_quantize_layer_value_cache_hbits = getattr(self, f"trans_quantize_value_cache_hbits{idx}")
-            new_trans_quantize_layer_value_cache_lbits = getattr(self, f"trans_quantize_value_cache_lbits{idx}")
-            new_min_layer_key_cache = getattr(self, f"min_key_cache_{idx}")
-            new_trans_min_layer_value_cache = getattr(self, f"trans_min_value_cache_{idx}")
-            new_scale_layer_key_cache = getattr(self, f"scale_key_cache_{idx}")
-            new_trans_scale_layer_value_cache = getattr(self, f"trans_scale_value_cache_{idx}")
+                torch._dynamo.mark_static_address(new_full_layer_key_cache)
+                torch._dynamo.mark_static_address(new_full_layer_value_cache)
+                torch._dynamo.mark_static_address(new_quantize_layer_key_cache_ubits)
+                torch._dynamo.mark_static_address(new_quantize_layer_key_cache_lbits)
+                torch._dynamo.mark_static_address(new_trans_quantize_layer_value_cache_ubits)
+                torch._dynamo.mark_static_address(new_trans_quantize_layer_value_cache_lbits)
 
-            torch._dynamo.mark_static_address(new_full_layer_key_cache)
-            torch._dynamo.mark_static_address(new_full_layer_value_cache)
-            torch._dynamo.mark_static_address(new_quantize_layer_key_cache_hbits)
-            torch._dynamo.mark_static_address(new_quantize_layer_key_cache_lbits)
-            torch._dynamo.mark_static_address(new_trans_quantize_layer_value_cache_hbits)
-            torch._dynamo.mark_static_address(new_trans_quantize_layer_value_cache_lbits)
+                torch._dynamo.mark_static_address(new_min_layer_key_cache)
+                torch._dynamo.mark_static_address(new_trans_min_layer_value_cache)
+                torch._dynamo.mark_static_address(new_scale_layer_key_cache)
+                torch._dynamo.mark_static_address(new_trans_scale_layer_value_cache)
 
-            torch._dynamo.mark_static_address(new_min_layer_key_cache)
-            torch._dynamo.mark_static_address(new_trans_min_layer_value_cache)
-            torch._dynamo.mark_static_address(new_scale_layer_key_cache)
-            torch._dynamo.mark_static_address(new_trans_scale_layer_value_cache)
+                self.full_key_cache.append(new_full_layer_key_cache)
+                self.full_value_cache.append(new_full_layer_value_cache)
+                self.quantize_key_cache_ubits.append(new_quantize_layer_key_cache_ubits)
+                self.quantize_key_cache_lbits.append(new_quantize_layer_key_cache_lbits)
+                self.trans_quantize_value_cache_ubits.append(new_trans_quantize_layer_value_cache_ubits)
+                self.trans_quantize_value_cache_lbits.append(new_trans_quantize_layer_value_cache_lbits)
 
-            self.full_key_cache.append(new_full_layer_key_cache)
-            self.full_value_cache.append(new_full_layer_value_cache)
-            self.quantize_key_cache_hbits.append(new_quantize_layer_key_cache_hbits)
-            self.quantize_key_cache_lbits.append(new_quantize_layer_key_cache_lbits)
-            self.trans_quantize_value_cache_hbits.append(new_trans_quantize_layer_value_cache_hbits)
-            self.trans_quantize_value_cache_lbits.append(new_trans_quantize_layer_value_cache_lbits)
-
-            self.min_key_cache.append(new_min_layer_key_cache)
-            self.trans_min_value_cache.append(new_trans_min_layer_value_cache)
-            self.scale_key_cache.append(new_scale_layer_key_cache)
-            self.trans_scale_value_cache.append(new_trans_scale_layer_value_cache)
+                self.min_key_cache.append(new_min_layer_key_cache)
+                self.trans_min_value_cache.append(new_trans_min_layer_value_cache)
+                self.scale_key_cache.append(new_scale_layer_key_cache)
+                self.trans_scale_value_cache.append(new_trans_scale_layer_value_cache)
 
         self.register_buffer("seq_len", torch.tensor(0, dtype=torch.long, device=self.device))
         self.register_buffer("quant_key_len", torch.tensor(0, dtype=torch.long, device=self.device))
@@ -132,9 +125,9 @@ class SimQCacheV2(Cache):
         for idx in range(self.layers):
             self.full_key_cache[idx].zero_()
             self.full_value_cache[idx].zero_()
-            self.quantize_key_cache_hbits[idx].zero_()
+            self.quantize_key_cache_ubits[idx].zero_()
             self.quantize_key_cache_lbits[idx].zero_()
-            self.trans_quantize_value_cache_hbits[idx].zero_()
+            self.trans_quantize_value_cache_ubits[idx].zero_()
             self.trans_quantize_value_cache_lbits[idx].zero_()
 
             self.min_key_cache[idx].zero_()
@@ -146,23 +139,41 @@ class SimQCacheV2(Cache):
         print("[Full Cache] Cached:", self.seq_len.item(), "| Quantized:", self.quant_key_len.item(), self.quant_val_len.item(), "| full_precision:", self.seq_len.item()-self.quant_key_len.item(), self.seq_len.item()-self.quant_val_len.item())
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs):
-        if self.seq_len.item() == 0: # prefill
-            output = (None, key_states, None, None)
-            output += (None, value_states, None, None)
+        if layer_idx < self.first_few_fp16_layers:
+            self.full_key_cache_fp16[layer_idx][:, :, self.seq_len:self.seq_len+key_states.shape[-2]].copy_(key_states)
+            self.full_value_cache_fp16[layer_idx][:, :, self.seq_len:self.seq_len+value_states.shape[-2]].copy_(value_states)
+            output = (
+                self.full_key_cache_fp16[layer_idx][:, :, :self.seq_len+key_states.shape[-2]],
+                None, None, None,
+            )
+            output += (
+                self.full_value_cache_fp16[layer_idx][:, :, :self.seq_len+value_states.shape[-2]],
+                None, None, None,
+            )
+            if layer_idx == self.layers:
+                self.seq_len += key_states.shape[-2]
+            return output
+
+        elif self.seq_len.item() == 0: # prefill
+            layer_idx -= self.first_few_fp16_layers
+            output = (key_states, None, None, None)
+            output += (value_states, None, None, None)
 
             prefill_len = key_states.shape[-2]
             assert prefill_len == value_states.shape[-2], "Key and value states must have the same length in prefill"
             if prefill_len > self.residual_length:
                 assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
                 to_quant_len = prefill_len-(prefill_len%self.residual_length)
-                self.full_key_cache[layer_idx][:, :, :prefill_len-to_quant_len].copy_(key_states[:, :, to_quant_len:])
-                self.full_value_cache[layer_idx][:, :, :prefill_len-to_quant_len].copy_(value_states[:, :, to_quant_len:])
+                if prefill_len-to_quant_len > 0:
 
-                key_states_quant_hbits, key_states_quant_lbits, key_scale, key_min = self.quantize_and_pack_along_penultimate_dim(key_states[:, :, :to_quant_len], self.group_size, self.k_bits)
-                value_states_quant_hbits, value_states_quant_lbits, value_scale, value_min = self.quantize_and_pack_along_penultimate_dim(value_states[:, :, :to_quant_len], self.group_size, self.v_bits)
-                self.quantize_key_cache_hbits[layer_idx][:, :, :to_quant_len].copy_(key_states_quant_hbits)
+                    self.full_key_cache[layer_idx][:, :, :prefill_len-to_quant_len].copy_(key_states[:, :, to_quant_len:])
+                    self.full_value_cache[layer_idx][:, :, :prefill_len-to_quant_len].copy_(value_states[:, :, to_quant_len:])
+
+                key_states_quant_ubits, key_states_quant_lbits, key_scale, key_min = self.quantize_and_pack_along_penultimate_dim(key_states[:, :, :to_quant_len], self.group_size, self.k_bits)
+                value_states_quant_ubits, value_states_quant_lbits, value_scale, value_min = self.quantize_and_pack_along_penultimate_dim(value_states[:, :, :to_quant_len], self.group_size, self.v_bits)
+                self.quantize_key_cache_ubits[layer_idx][:, :, :to_quant_len].copy_(key_states_quant_ubits)
                 self.quantize_key_cache_lbits[layer_idx][:, :, :to_quant_len].copy_(key_states_quant_lbits)
-                self.trans_quantize_value_cache_hbits[layer_idx][:, :, :, :to_quant_len].copy_(value_states_quant_hbits)
+                self.trans_quantize_value_cache_ubits[layer_idx][:, :, :, :to_quant_len].copy_(value_states_quant_ubits)
                 self.trans_quantize_value_cache_lbits[layer_idx][:, :, :, :to_quant_len].copy_(value_states_quant_lbits)
 
                 self.scale_key_cache[layer_idx][:, :, :to_quant_len//self.group_size].copy_(key_scale)
@@ -170,878 +181,76 @@ class SimQCacheV2(Cache):
                 self.trans_scale_value_cache[layer_idx][:, :, :, :to_quant_len].copy_(value_scale)
                 self.trans_min_value_cache[layer_idx][:, :, :, :to_quant_len].copy_(value_min)
 
-                if layer_idx == self.layers-1:
+                if layer_idx == self.layers-self.first_few_fp16_layers-1:
                     self.quant_key_len += to_quant_len
                     self.quant_val_len += to_quant_len
                     self.seq_len += prefill_len
             return output
+        else: # decode
+            layer_idx -= self.first_few_fp16_layers
+            self.full_key_cache[layer_idx][:, :, self.seq_len-self.quant_key_len:self.seq_len-self.quant_key_len+key_states.shape[-2]].copy_(key_states)
+            self.full_value_cache[layer_idx][:, :, self.seq_len-self.quant_val_len:self.seq_len-self.quant_val_len+value_states.shape[-2]].copy_(value_states)
+            output = (
+                self.full_key_cache[layer_idx][:, :, :self.seq_len-self.quant_key_len+key_states.shape[-2]],
+                self.quantize_key_cache_ubits[layer_idx][:, :, :self.quant_key_len],
+                self.quantize_key_cache_lbits[layer_idx][:, :, :self.quant_key_len],
+                self.scale_key_cache[layer_idx][:, :, :self.quant_key_len//self.group_size],
+                self.min_key_cache[layer_idx][:, :, :self.quant_key_len//self.group_size],
+            )
+            output += (
+                self.full_value_cache[layer_idx][:, :, :self.seq_len-self.quant_val_len+value_states.shape[-2]],
+                self.trans_quantize_value_cache_ubits[layer_idx][:, :, :, :self.quant_val_len],
+                self.trans_quantize_value_cache_lbits[layer_idx][:, :, :, :self.quant_val_len],
+                self.trans_scale_value_cache[layer_idx][:, :, :, :self.quant_val_len],
+                self.trans_min_value_cache[layer_idx][:, :, :, :self.quant_val_len],
+            )
+            if layer_idx == self.layers-self.first_few_fp16_layers-1:
+                self.seq_len += key_states.shape[-2]
+            return output
 
     def quantize_and_pack(self):
-        pass
+        full_key_len = self.seq_len - self.quant_key_len
+        if full_key_len > self.residual_length:
+            assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
+            to_quant_len = full_key_len-(full_key_len%self.residual_length)
+            for layer_idx in range(self.layers-self.first_few_fp16_layers):
+                to_quant_key_states = self.full_key_cache[layer_idx][:, :, :to_quant_len]
+                key_states_quant_ubits, key_states_quant_lbits, key_scale, key_min = self.quantize_and_pack_along_penultimate_dim(to_quant_key_states, self.group_size, self.k_bits)
+                self.full_key_cache[layer_idx][:, :, :full_key_len-to_quant_len].copy_(self.full_key_cache[layer_idx][:, :, to_quant_len:full_key_len].clone())
+
+                self.quantize_key_cache_ubits[layer_idx][:, :, self.quant_key_len:(self.quant_key_len+to_quant_len)].copy_(key_states_quant_ubits)
+                self.quantize_key_cache_lbits[layer_idx][:, :, self.quant_key_len:(self.quant_key_len+to_quant_len)].copy_(key_states_quant_lbits)
+                self.scale_key_cache[layer_idx][:, :, self.quant_key_len//self.group_size:(self.quant_key_len+to_quant_len)//self.group_size].copy_(key_scale)
+                self.min_key_cache[layer_idx][:, :, self.quant_key_len//self.group_size:(self.quant_key_len+to_quant_len)//self.group_size].copy_(key_min)
+            self.quant_key_len += to_quant_len
+
+        full_val_len = self.seq_len - self.quant_val_len
+        if full_val_len > self.residual_length:
+            assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
+            to_quant_len = full_val_len-self.residual_length
+            for layer_idx in range(self.layers-self.first_few_fp16_layers):
+                to_quant_value_states = self.full_value_cache[layer_idx][:, :, :to_quant_len]
+                value_states_quant_ubits, value_states_quant_lbits, value_scale, value_min = self.quantize_and_pack_along_penultimate_dim(to_quant_value_states, self.group_size, self.v_bits)
+                self.full_value_cache[layer_idx][:, :, :full_val_len-to_quant_len].copy_(self.full_value_cache[layer_idx][:, :, to_quant_len:full_val_len].clone())
+
+                self.trans_quantize_value_cache_ubits[layer_idx][:, :, :, self.quant_val_len:(self.quant_val_len+to_quant_len)].copy_(value_states_quant_ubits)
+                self.trans_quantize_value_cache_lbits[layer_idx][:, :, :, self.quant_val_len:(self.quant_val_len+to_quant_len)].copy_(value_states_quant_lbits)
+                self.trans_scale_value_cache[layer_idx][:, :, :, self.quant_val_len:(self.quant_val_len+to_quant_len)].copy_(value_scale)
+                self.trans_min_value_cache[layer_idx][:, :, :, self.quant_val_len:(self.quant_val_len+to_quant_len)].copy_(value_min)
+            self.quant_val_len += to_quant_len
         
     def quantize_and_pack_along_penultimate_dim(self, inp, group_size, bits):
         num_groups = inp.size(-2) // group_size
         inp = inp.reshape(*inp.shape[:-2], num_groups, group_size, -1)
         maxval = torch.max(inp, dim=-2).values
         minval = torch.min(inp, dim=-2).values
-        scale = (maxval - minval)/(2**bits - 1)
-        q_inp = inp - minval.unsqueeze(-2)
-        q_inp = q_inp / scale.unsqueeze(-2)
-        q_inp = torch.clip(q_inp, min=0, max=2**bits-1).round().to(torch.int32)
-        
-
-
-        return q_inp.reshape(*inp.shape[:-2], -1, inp.shape[-1]), scale, minval
-
-class SimQCache(Cache):
-    def __init__(self, model, max_budget=1024) -> None:
-        self.seq_len = 0
-        self.quant_key_len = 0
-        self.quant_val_len = 0
-        self.residual_length = model.config.residual_length
-        # self.num_key_value_heads = model.config.num_key_value_heads
-        self.group_size = model.config.group_size
-        self.k_bits = model.config.k_bits 
-        self.v_bits = model.config.v_bits
-        self.max_budget = max_budget
-
-        self.hidden_size = model.config.hidden_size
-        self.num_heads = model.config.num_key_value_heads
-        self.head_dim = self.hidden_size // model.config.num_attention_heads
-        self.layers = model.config.num_hidden_layers
-
-        dtype = model.model.layers[0].self_attn.q_proj.weight.dtype
-        self.key_states_quant = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim], dtype=torch.int32).to(model.device)
-        self.key_scale = torch.zeros([self.layers, 1, self.num_heads,self.max_budget//self.group_size, self.head_dim], dtype=dtype).to(model.device)
-        self.key_mn = torch.zeros([self.layers, 1, self.num_heads, self.max_budget//self.group_size, self.head_dim], dtype=dtype).to(model.device)
-        self.key_states_full = torch.zeros([self.layers, 1, self.num_heads, 2*self.residual_length, self.head_dim], dtype=dtype).to(model.device)
-
-
-        self.value_states_quant_trans = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim], dtype=torch.int32).to(model.device)
-        self.value_scale_trans = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim//self.group_size], dtype=dtype).to(model.device)
-        self.value_mn_trans = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim//self.group_size], dtype=dtype).to(model.device)
-        self.value_states_full = torch.zeros([self.layers, 1, self.num_heads, 2*self.residual_length, self.head_dim], dtype=dtype).to(model.device)
-
-    def print_status(self):
-        print("[Full Cache] Cached:", self.seq_len, "| Quantized:", self.quant_key_len, self.quant_val_len, "| full_precision:", self.seq_len-self.quant_key_len, self.seq_len-self.quant_val_len)
-
-    def reset(self):
-        self.seq_len = 0
-        self.quant_key_len = 0
-        self.quant_val_len = 0
-        self.key_states_full.zero_()
-        self.value_states_full.zero_()
-        self.key_states_quant_trans.zero_()
-        self.key_scale_trans.zero_()
-        self.key_mn_trans.zero_()
-        self.value_states_quant.zero_()
-        self.value_scale.zero_()
-        self.value_mn.zero_()
-    
-    def update_and_quantize_packed(self, key_states, value_states, layer_idx, cache_kwargs):
-        full_key_len = key_states.shape[-2]
-        if full_key_len > self.residual_length:
-            assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
-            to_quant_len = full_key_len-(full_key_len%self.residual_length)
-            to_quant_key_states = key_states[:, :, :to_quant_len].clone()
-            self.key_states_full[layer_idx][:, :, :full_key_len-to_quant_len] = key_states[:, :, to_quant_len:].clone()
-            
-            
-            key_states_quant_trans_new, key_scale_trans_new, key_mn_trans_new = self.quantize_and_pack_along_last_dim(
-                to_quant_key_states.transpose(2,3).contiguous(), self.group_size, self.k_bits
-            )
-            self.key_states_quant_trans[layer_idx][:, :, :, self.quant_key_len:(self.quant_key_len+to_quant_len)] = key_states_quant_trans_new
-            self.key_scale_trans[layer_idx][:, :, :, self.quant_key_len//self.group_size:(self.quant_key_len+to_quant_len)//self.group_size] = key_scale_trans_new
-            self.key_mn_trans[layer_idx][:, :, :, self.quant_key_len//self.group_size:(self.quant_key_len+to_quant_len)//self.group_size] = key_mn_trans_new
-            if layer_idx == self.layers-1:
-                self.quant_key_len += to_quant_len
-
-        full_val_len = value_states.shape[-2]
-        if full_val_len > self.residual_length:
-            assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
-            to_quant_len = full_val_len-self.residual_length
-            value_states_full = self.value_states_full[layer_idx][:, :, :to_quant_len].clone()
-            self.value_states_full[layer_idx][:, :, :-(to_quant_len)] = self.value_states_full[layer_idx][:, :, to_quant_len:].clone().contiguous()
-            
-            value_states_quant_new, value_scale_new, value_mn_new = self.quantize_and_pack_along_last_dim(
-                value_states_full.contiguous(), self.group_size, self.v_bits
-            )
-            self.value_states_quant[layer_idx][:, :, self.quant_val_len:(self.quant_val_len+to_quant_len)] = value_states_quant_new.contiguous()
-            self.value_scale[layer_idx][:, :, self.quant_val_len:(self.quant_val_len+to_quant_len)] = value_scale_new
-            self.value_mn[layer_idx][:, :, self.quant_val_len:(self.quant_val_len+to_quant_len)] = value_mn_new
-            if layer_idx == self.layers-1:
-                self.quant_val_len += to_quant_len
-    
-    def update(self, key_states, value_states, layer_idx, cache_kwargs):
-
-        self.key_states_full[layer_idx][:, :, self.seq_len-self.quant_key_len : self.seq_len - self.quant_key_len + key_states.shape[-2]] = key_states
-        self.value_states_full[layer_idx][:, :, self.seq_len-self.quant_val_len : self.seq_len - self.quant_val_len + value_states.shape[-2]] = value_states
-
-
-        if self.quant_key_len == 0:
-            output = (None, self.key_states_full[layer_idx][:,:, :self.seq_len+key_states.shape[-2]], None, None,)
-        else:
-            output = (
-                self.key_states_quant_trans[layer_idx][:,:, :, :self.quant_key_len],
-                self.key_states_full[layer_idx][:,:, :self.seq_len-self.quant_key_len+key_states.shape[-2]],
-                self.key_scale_trans[layer_idx][:,:, :, :self.quant_key_len//self.group_size],       
-                self.key_mn_trans[layer_idx][:,:, :, :self.quant_key_len//self.group_size],
-            )
-        if self.quant_val_len == 0:
-            output += (None, self.value_states_full[layer_idx][:,:, :self.seq_len-self.quant_val_len+value_states.shape[-2]], None, None)
-        else:
-            output += (
-                self.value_states_quant[layer_idx][:,:, :self.quant_val_len],
-                self.value_states_full[layer_idx][:,:, :self.seq_len-self.quant_val_len+value_states.shape[-2]],
-                self.value_scale[layer_idx][:,:, :self.quant_val_len],
-                self.value_mn[layer_idx][:,:, :self.quant_val_len],
-            )
-        if layer_idx == self.layers-1:
-            self.seq_len += key_states.size(2)
-        return output 
-    
-    def quantize_and_pack(self):
-        full_key_len = self.seq_len - self.quant_key_len
-        if full_key_len > self.residual_length:
-            assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
-            to_quant_len = full_key_len-(full_key_len%self.residual_length)
-            for layer_idx in range(self.layers):
-                to_quant_key_states = self.key_states_full[layer_idx][:, :, :to_quant_len].clone()
-                self.key_states_full[layer_idx][:, :, :-to_quant_len] = self.key_states_full[layer_idx][:, :, to_quant_len:].clone()
-                
-                
-                key_states_quant_trans_new, key_scale_trans_new, key_mn_trans_new = self.quantize_and_pack_along_last_dim(
-                    to_quant_key_states.transpose(2,3).contiguous(), self.group_size, self.k_bits
-                )
-                self.key_states_quant_trans[layer_idx][:, :, :, self.quant_key_len:(self.quant_key_len+to_quant_len)] = key_states_quant_trans_new
-                self.key_scale_trans[layer_idx][:, :, :, self.quant_key_len//self.group_size:(self.quant_key_len+to_quant_len)//self.group_size] = key_scale_trans_new
-                self.key_mn_trans[layer_idx][:, :, :, self.quant_key_len//self.group_size:(self.quant_key_len+to_quant_len)//self.group_size] = key_mn_trans_new
-            self.quant_key_len += to_quant_len
-
-        full_val_len = self.seq_len - self.quant_val_len
-        if full_val_len > self.residual_length:
-            assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
-            to_quant_len = full_val_len-self.residual_length
-            for layer_idx in range(self.layers):
-                value_states_full = self.value_states_full[layer_idx][:, :, :to_quant_len].clone()
-                self.value_states_full[layer_idx][:, :, :-(to_quant_len)] = self.value_states_full[layer_idx][:, :, to_quant_len:].clone().contiguous()
-                
-                value_states_quant_new, value_scale_new, value_mn_new = self.quantize_and_pack_along_last_dim(
-                    value_states_full.contiguous(), self.group_size, self.v_bits
-                )
-                self.value_states_quant[layer_idx][:, :, self.quant_val_len:(self.quant_val_len+to_quant_len)] = value_states_quant_new.contiguous()
-                self.value_scale[layer_idx][:, :, self.quant_val_len:(self.quant_val_len+to_quant_len)] = value_scale_new
-                self.value_mn[layer_idx][:, :, self.quant_val_len:(self.quant_val_len+to_quant_len)] = value_mn_new
-            self.quant_val_len += to_quant_len
-
-    def quantize_and_pack_along_last_dim(self, inp, group_size, bits):
-        # import IPython
-        # IPython.embed()
-        num_groups = inp.size(-1) // group_size
-        
-        inp = inp.reshape(*inp.shape[:-1], num_groups, group_size)
-        maxval = torch.max(inp, dim=-1).values
-        minval = torch.min(inp, dim=-1).values
-        # print('inp', inp.shape)
-
-        scale = (maxval - minval)/(2**bits - 1)
-        q_inp = inp - minval.unsqueeze(-1)
-        q_inp = q_inp / scale.unsqueeze(-1)
-
-        q_inp = torch.clip(q_inp, min=0, max=2**bits-1).round().to(torch.int32)
-        # q_inp_out = q_inp*scale.unsqueeze(-1) + minval.unsqueeze(-1)
-        # q_inp_out = torch.nan_to_num(q_inp_out, nan=0.0, posinf=0.0, neginf=0.0)
-        # import IPython
-        # IPython.embed()
-        return q_inp.reshape(*inp.shape[:-2], -1), scale, minval
-
-
-class QCache(Cache):
-    def __init__(self, model, max_budget=1024, variation='0') -> None:
-        self.seq_len = 0
-        self.quant_key_len = 0
-        self.quant_val_len = 0
-        self.residual_length = model.config.residual_length
-        # self.num_key_value_heads = model.config.num_key_value_heads
-        self.group_size = model.config.group_size
-        self.k_bits = model.config.k_bits
-        self.v_bits = model.config.v_bits
-        self.max_budget = max_budget
-        self.variation = variation
-        self.hidden_size = model.config.hidden_size
-        self.num_heads = model.config.num_key_value_heads
-        self.head_dim = self.hidden_size // model.config.num_attention_heads
-        self.layers = model.config.num_hidden_layers
-
-        dtype = model.model.layers[0].self_attn.q_proj.weight.dtype
-        self.key_states_quant_trans = torch.zeros([self.layers, 1, self.num_heads, self.head_dim, self.max_budget//(32//self.k_bits)], dtype=torch.int32).to(model.device)
-        self.key_scale_trans = torch.zeros([self.layers, 1, self.num_heads, self.head_dim, self.max_budget//self.group_size], dtype=dtype).to(model.device)
-        self.key_mn_trans = torch.zeros([self.layers, 1, self.num_heads, self.head_dim, self.max_budget//self.group_size], dtype=dtype).to(model.device)
-        self.key_states_full = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim], dtype=dtype).to(model.device)
-
-
-        self.value_states_quant = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim//(32//self.v_bits)], dtype=torch.int32).to(model.device)
-        self.value_scale = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim//self.group_size], dtype=dtype).to(model.device)
-        self.value_mn = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim//self.group_size], dtype=dtype).to(model.device)
-        self.value_states_full = torch.zeros([self.layers, 1, self.num_heads, self.max_budget, self.head_dim], dtype=dtype).to(model.device)
-
-    def print_status(self):
-        print("[Full Cache] Cached:", self.seq_len, "| Quantized:", self.quant_key_len, self.quant_val_len, "| full_precision:", self.seq_len-self.quant_key_len, self.seq_len-self.quant_val_len)
-
-    def reset(self):
-        self.seq_len = 0
-        self.quant_key_len = 0
-        self.quant_val_len = 0
-        self.key_states_full.zero_()
-        self.value_states_full.zero_()
-        self.key_states_quant_trans.zero_()
-        self.key_scale_trans.zero_()
-        self.key_mn_trans.zero_()
-        self.value_states_quant.zero_()
-        self.value_scale.zero_()
-        self.value_mn.zero_()
-    
-    def update(self, key_states, value_states, layer_idx):
-
-        self.key_states_full[layer_idx][:, :, self.seq_len-self.quant_key_len : self.seq_len - self.quant_key_len + key_states.shape[-2]] = key_states
-        self.value_states_full[layer_idx][:, :, self.seq_len-self.quant_val_len : self.seq_len - self.quant_val_len + value_states.shape[-2]] = value_states
-
-
-        if self.quant_key_len == 0:
-            output = (None, self.key_states_full[layer_idx][:,:, :self.seq_len+key_states.shape[-2]], None, None,)
-        else:
-            output = (
-                self.key_states_quant_trans[layer_idx][:,:, :, :self.quant_key_len//(32//self.k_bits)],
-                self.key_states_full[layer_idx][:,:, :self.seq_len-self.quant_key_len+key_states.shape[-2]],
-                self.key_scale_trans[layer_idx][:,:, :, :self.quant_key_len//self.group_size],       
-                self.key_mn_trans[layer_idx][:,:, :, :self.quant_key_len//self.group_size],
-            )
-        if self.quant_val_len == 0:
-            output += (None, self.value_states_full[layer_idx][:,:, :self.seq_len-self.quant_val_len+value_states.shape[-2]], None, None)
-        else:
-            output += (
-                self.value_states_quant[layer_idx][:,:, :self.quant_val_len],
-                self.value_states_full[layer_idx][:,:, :self.seq_len-self.quant_val_len+value_states.shape[-2]],
-                self.value_scale[layer_idx][:,:, :self.quant_val_len],
-                self.value_mn[layer_idx][:,:, :self.quant_val_len],
-            )
-        if layer_idx == self.layers-1:
-            self.seq_len += key_states.size(2)
-        return output 
-    
-    def quantize_and_pack(self):
-        full_key_len = self.seq_len - self.quant_key_len
-        if full_key_len > self.residual_length:
-            assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
-            to_quant_len = full_key_len-(full_key_len%self.residual_length)
-            for layer_idx in range(self.layers):
-                to_quant_key_states = self.key_states_full[layer_idx][:, :, :to_quant_len].clone()
-                self.key_states_full[layer_idx][:, :, :-to_quant_len] = self.key_states_full[layer_idx][:, :, to_quant_len:].clone()
-                
-                key_states_quant_trans_new, key_scale_trans_new, key_mn_trans_new = triton_quantize_and_pack_along_last_dim(
-                    to_quant_key_states.transpose(2,3).contiguous(), self.group_size, self.k_bits
-                )
-                self.key_states_quant_trans[layer_idx][:, :, :, self.quant_key_len//(32//self.k_bits):(self.quant_key_len+to_quant_len)//(32//self.k_bits)] = key_states_quant_trans_new
-                self.key_scale_trans[layer_idx][:, :, :, self.quant_key_len//self.group_size:(self.quant_key_len+to_quant_len)//self.group_size] = key_scale_trans_new
-                self.key_mn_trans[layer_idx][:, :, :, self.quant_key_len//self.group_size:(self.quant_key_len+to_quant_len)//self.group_size] = key_mn_trans_new
-            self.quant_key_len += to_quant_len
-
-        full_val_len = self.seq_len - self.quant_val_len
-        if full_val_len > self.residual_length:
-            assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
-            if self.variation == '0':
-                to_quant_len = full_val_len-self.residual_length
-            elif self.variation == '1':
-                to_quant_len = full_key_len-(full_key_len%self.residual_length)
-            elif self.variation == '2':
-                to_quant_len = full_val_len-self.residual_length//2-(full_val_len%(self.residual_length//2))
-            else:
-                raise ValueError(f"Invalid variation: {self.variation}")
-            
-            for layer_idx in range(self.layers):
-                value_states_full = self.value_states_full[layer_idx][:, :, :to_quant_len].clone()
-                self.value_states_full[layer_idx][:, :, :-(to_quant_len)] = self.value_states_full[layer_idx][:, :, to_quant_len:].clone().contiguous()
-                value_states_quant_new, value_scale_new, value_mn_new = triton_quantize_and_pack_along_last_dim(
-                    value_states_full.contiguous(), self.group_size, self.v_bits
-                )
-                self.value_states_quant[layer_idx][:, :, self.quant_val_len:(self.quant_val_len+to_quant_len)] = value_states_quant_new.contiguous()
-                self.value_scale[layer_idx][:, :, self.quant_val_len:(self.quant_val_len+to_quant_len)] = value_scale_new
-                self.value_mn[layer_idx][:, :, self.quant_val_len:(self.quant_val_len+to_quant_len)] = value_mn_new
-            self.quant_val_len += to_quant_len
-
-            # if self.seq_len == self.max_budget:
-            #     break
-
-        # return self.key_states_quant_trans, self.key_scale_trans, self.key_mn_trans, self.value_states_quant, self.value_scale, self.value_mn
-    
-
-
-    
-############## Single GPU Cache ###############
-class FlashSimpleCache(Cache):
-    def __init__(self, model, max_budget=1024) -> None:
-        raise ValueError("Not being used now. Use SimUniformDynamicCache instead.")
-
-        self.seq_len = 0
-        self.max_budget = max_budget
-
-        self.hidden_size = model.config.hidden_size
-        self.num_heads = model.config.num_key_value_heads
-        self.head_dim = self.hidden_size // model.config.num_attention_heads
-        self.layers = model.config.num_hidden_layers
-
-        dtype = model.model.layers[0].self_attn.q_proj.weight.dtype
-
-        self.key_cache = torch.zeros([self.layers, 1, self.max_budget, self.num_heads, self.head_dim], dtype=dtype).to(model.device)
-        self.value_cache = torch.zeros([self.layers, 1, self.max_budget, self.num_heads, self.head_dim], dtype=dtype).to(model.device)
-
-        self.scores = []
-
-    def print_status(self):
-        print("[Full Cache] Cached:", self.seq_len, "| Budget:", self.max_budget)
-    
-    def reset(self):
-        self.seq_len = 0
-        for i in range(self.layers):
-            self.key_cache[i].zero_()
-            self.value_cache[i].zero_()
-
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        self.key_cache[layer_idx][:, self.seq_len : self.seq_len + key_states.shape[-3]] = key_states
-        self.value_cache[layer_idx][:, self.seq_len : self.seq_len + value_states.shape[-3]] = value_states
-
-        key = self.key_cache[layer_idx][:, :self.seq_len + value_states.shape[-3]]
-        value = self.value_cache[layer_idx][:, :self.seq_len + value_states.shape[-3]]
-
-        if layer_idx == self.layers-1:
-            self.seq_len += key_states.shape[-3]
-
-        return key, value
-
-class OffloadingFlashSimpleCache(Cache):
-    def __init__(self, model, max_budget=1024) -> None:
-        self.seq_len = 0
-        self.max_budget = max_budget
-
-        self.hidden_size = model.config.hidden_size
-        self.num_heads = model.config.num_key_value_heads
-        self.head_dim = self.hidden_size // model.config.num_attention_heads
-        self.layers = model.config.num_hidden_layers
-
-        dtype = model.model.layers[0].self_attn.q_proj.weight.dtype
-        self.device = model.device
-
-        self.key_cache = torch.zeros([self.layers, 1, self.max_budget, self.num_heads, self.head_dim], dtype=dtype, device='cpu').pin_memory()
-        self.value_cache = torch.zeros([self.layers, 1, self.max_budget, self.num_heads, self.head_dim], dtype=dtype, device='cpu').pin_memory()
-
-        # init layer cache buffer on chip
-        self.key_cache_buffer = torch.zeros([1, self.max_budget, self.num_heads, self.head_dim], dtype=dtype, device=self.device)
-        self.value_cache_buffer = torch.zeros([1, self.max_budget, self.num_heads, self.head_dim], dtype=dtype, device=self.device)
-
-        self.load_stream = torch.cuda.Stream(device=self.device)
-
-    def print_status(self):
-        print("[Offloading Flash Simple Cache] Cached Size:", self.seq_len, "| Budget:", self.max_budget)
-    
-    def reset(self):
-        self.seq_len = 0
-        for i in range(self.layers):
-            self.key_cache[i].zero_()
-            self.value_cache[i].zero_()
-
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        
-        # copy incoming k v cache to cpu
-        self.key_cache[layer_idx][:, self.seq_len : self.seq_len + key_states.shape[-3]] = key_states.cpu()
-        self.value_cache[layer_idx][:, self.seq_len : self.seq_len + value_states.shape[-3]] = value_states.cpu()
-
-        # copy k v cache to buffer
-        self.key_cache_buffer.copy_(self.key_cache[layer_idx], non_blocking=True)
-        self.value_cache_buffer.copy_(self.value_cache[layer_idx], non_blocking=True)
-        
-        key = self.key_cache_buffer[:, :self.seq_len + value_states.shape[-3]]
-        value = self.value_cache_buffer[:, :self.seq_len + value_states.shape[-3]]
-
-        if layer_idx == self.layers-1:
-            self.seq_len += key_states.shape[-3]
-
-        return key, value
-
-class RetrievalCache(Cache):
-    def __init__(self, model, max_budget=1024, prefill=1024, chunk_size=8, gamma=6) -> None:
-        
-        self.chunk_size = chunk_size
-        self.prefill = prefill
-        self.chunks = prefill // self.chunk_size
-        self.select_sets = max_budget // self.chunk_size
-        self.gamma = gamma
-        self.max_budget = max_budget
-        assert prefill % self.chunk_size == 0, f"prefill should be multiple of chunk_size, got {prefill} % {self.chunk_size}"
-        assert max_budget % self.chunk_size == 0, f"max_budget should be multiple of chunk_size, got {max_budget} % {self.chunk_size}"
-
-        self.real_budget = max_budget + gamma + 1
-
-        self.hidden_size = model.config.hidden_size
-        self.num_heads = model.config.num_key_value_heads
-        self.head_dim = self.hidden_size // model.config.num_attention_heads
-        self.layers = model.config.num_hidden_layers
-
-        dtype = model.model.layers[0].self_attn.q_proj.weight.dtype
-
-        self.key_cache = torch.zeros([self.layers, 1, self.real_budget, self.num_heads, self.head_dim], dtype=dtype).to(model.device)
-        self.value_cache = torch.zeros([self.layers, 1, self.real_budget, self.num_heads, self.head_dim], dtype=dtype).to(model.device)
-
-        self.init_graph = False
-
-    def print_status(self):
-        print("[Retrieval Cache] Budget:", self.max_budget, " | PreFill:", self.prefill, " | Chunk Size:", self.chunk_size, " | Chunks:", self.chunks, " | Select Sets:", self.select_sets)
-
-    def init_graph_cache(self, kv_cache, query_states, layer_idx):
-
-        # query_states: (bsz, 1, 32, head_dim) --> (bsz, 32, 1, head_dim)
-        # key_cache: (bsz, seq_len, 32, head_dim) --> (bsz, 32, head_dim, seq_len)
-        # print(query_states.shape, self.chunk_k[layer_idx].shape)
-
-        assert 1 == query_states.shape[1], "query_states should be 1 for init"
-
-        chunk_k = kv_cache.key_cache[layer_idx,:,:self.prefill].cuda().view(1, self.chunks, self.chunk_size, self.num_heads, self.head_dim).mean(dim=-3)
-        
-        # (bsz, 32, chunks)
-        chunk_attn = torch.matmul(query_states.permute(0, 2, 1, 3), chunk_k.permute(0, 2, 3, 1)).squeeze(2)
-        # (bsz, 32, select_sets) --> (bsz, select_sets, 32)
-        _, topk_idx_rest = torch.topk(chunk_attn[:, :, 1:], k=self.select_sets-1, dim=-1)
-        topk_idx_rest += 1
-        topk_idx_first = torch.zeros((topk_idx_rest.shape[0], topk_idx_rest.shape[1], 1), device=topk_idx_rest.device, dtype=topk_idx_rest.dtype)
-        topk_idx = torch.cat([topk_idx_first, topk_idx_rest], dim=-1)  # (bsz, 32, select_sets)
-        expanded_index_tensor = topk_idx.permute(0, 2, 1).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, self.chunk_size, self.head_dim)
-
-        # (bsz, prefill, 32, head_dim) --> (bsz, chunks, chunk_size, 32, head_dim) --> (bsz, chunks, 32, chunk_size, head_dim)
-        key_ = kv_cache.key_cache[layer_idx][:, :self.prefill].reshape(1, self.chunks, self.chunk_size, self.num_heads, self.head_dim).cuda()
-        key_ = key_.permute(0, 1, 3, 2, 4)
-        result_tensor = torch.gather(key_, 1, expanded_index_tensor) # (bsz, select_sets, 32, chunk_size, head_dim)
-        # (bsz, select_sets, 32, chunk_size, head_dim) --> (bsz, select_sets*chunk_size, 32, head_dim)
-        self.key_cache[layer_idx][:,:self.max_budget] = result_tensor.permute(0, 1, 3, 2, 4).reshape(1, self.select_sets*self.chunk_size, self.num_heads, self.head_dim).clone()
-
-        value_ = kv_cache.value_cache[layer_idx][:, :self.prefill].reshape(1, self.chunks, self.chunk_size, self.num_heads, self.head_dim).cuda()
-        value_ = value_.permute(0, 1, 3, 2, 4)
-        result_tensor = torch.gather(value_, 1, expanded_index_tensor)
-        self.value_cache[layer_idx][:,:self.max_budget] = result_tensor.permute(0, 1, 3, 2, 4).reshape(1, self.select_sets*self.chunk_size, self.num_heads, self.head_dim).clone()
-
-        if layer_idx == self.layers-1:
-            self.init_graph = True
-
-    def update_graph_cache(self, kv_cache=None):
-        self.value_cache[:,:,self.max_budget-(kv_cache.seq_len-self.prefill):self.max_budget] = kv_cache.value_cache[:,:, self.prefill:kv_cache.seq_len].clone()
-        self.key_cache[:,:,self.max_budget-(kv_cache.seq_len-self.prefill):self.max_budget] = kv_cache.key_cache[:,:, self.prefill:kv_cache.seq_len].clone()
-
-    def update(self, new_k_cache :torch.Tensor, new_v_cache :torch.Tensor, layer_idx :int):
-
-        self.key_cache[layer_idx][:, self.real_budget-self.gamma-1:] = new_k_cache.clone()
-        self.value_cache[layer_idx][:, self.real_budget-self.gamma-1:] = new_v_cache.clone()
-
-        return self.key_cache[layer_idx][:,:self.real_budget], self.value_cache[layer_idx][:,:self.real_budget]
-
-    def update_graph_cache_retrieval(self, kv_cache, query_states, layer_idx):
-        self.init_graph_cache(kv_cache, query_states, layer_idx)
-        self.value_cache[layer_idx,:,self.max_budget-(kv_cache.seq_len-self.prefill):self.max_budget] = kv_cache.value_cache[layer_idx,:, self.prefill:kv_cache.seq_len].clone()
-        self.key_cache[layer_idx,:,self.max_budget-(kv_cache.seq_len-self.prefill):self.max_budget] = kv_cache.key_cache[layer_idx,:, self.prefill:kv_cache.seq_len].clone()
-
-    def reset(self):
-        self.key_cache.zero_()
-        self.value_cache.zero_()
-
-class StreamingLLMEvictionCache(Cache):
-
-    def __init__(self, model, gamma=6, start_size=16, recent_size=496) -> None:
-
-        self.gamma = gamma
-        self.start_size = start_size
-        self.recent_size = recent_size
-        self.real_budget = self.start_size + self.recent_size + self.gamma + 1 + 1 + 1
-
-        self.seq_len = 0 # just for prefill usage
-
-        self.hidden_size = model.config.hidden_size
-        self.num_heads = model.config.num_key_value_heads
-        self.head_dim = self.hidden_size // model.config.num_attention_heads
-        self.layers = model.config.num_hidden_layers
-
-        self.key_cache = torch.zeros([self.layers, 1, self.real_budget, self.num_heads, self.head_dim], dtype=torch.float16).to(model.device)
-        self.value_cache = torch.zeros([self.layers, 1, self.real_budget, self.num_heads, self.head_dim], dtype=torch.float16).to(model.device)
-    
-    def print_status(self):
-        print("[StreamingLLM Cache] Start Size:", self.start_size, "| Recent Size:", self.recent_size, "| Gamma:", self.gamma, "| Real Budget:", self.real_budget, "| Cached:", self.seq_len)
-
-    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int):
-        
-        incoming = key_states.shape[-3]
-
-        assert self.seq_len + incoming <= self.start_size + self.recent_size
-        self.key_cache[layer_idx][:, self.seq_len:self.seq_len + incoming] = key_states.clone()
-        self.value_cache[layer_idx][:, self.seq_len:self.seq_len + incoming] = value_states.clone()
-
-        key = self.key_cache[layer_idx][:, :self.seq_len + incoming]
-        value = self.value_cache[layer_idx][:, :self.seq_len + incoming]
-
-        if layer_idx == self.layers-1:
-            self.seq_len += incoming
-        return key, value
-
-    def spec_update(self, new_k_cache :torch.Tensor, new_v_cache :torch.Tensor, layer_idx :int, gamma_offset=0):
-
-        start = self.real_budget-self.gamma-3
-        end = self.real_budget-self.gamma-3+new_k_cache.shape[-3]
-
-        self.key_cache[layer_idx][:, start:end] = new_k_cache.clone()
-        self.value_cache[layer_idx][:, start:end] = new_v_cache.clone()
-
-        return self.key_cache[layer_idx][:,:end], self.value_cache[layer_idx][:,:end]
-
-    def reset(self):
-        for i in range(self.layers):
-            self.key_cache[i].zero_()
-            self.value_cache[i].zero_()
-
-    def evict_prefill(self, incoming):
-        # evict
-        if self.seq_len + incoming <= self.start_size + self.recent_size:
-            return
-        for layer_idx in range(self.layers):
-            size_keep = self.recent_size - incoming
-            self.key_cache[layer_idx][:, self.start_size:self.start_size+size_keep] = self.key_cache[layer_idx][:, self.seq_len-size_keep:self.seq_len].clone()
-            self.value_cache[layer_idx][:, self.start_size:self.start_size+size_keep] = self.value_cache[layer_idx][:, self.seq_len-size_keep:self.seq_len].clone()
-
-        self.seq_len = self.start_size + self.recent_size - incoming
-
-    def evict_for_spec(self, current_seq_len):
-        self.key_cache[:,:,self.start_size:self.start_size+self.recent_size] = self.key_cache[:,:, current_seq_len-self.recent_size:current_seq_len].clone()
-        self.value_cache[:,:, self.start_size:self.start_size+self.recent_size] = self.value_cache[:,:, current_seq_len-self.recent_size:current_seq_len].clone()
-
-############## Dist Cache ###############
-class DistributedSimpleCache(Cache):
-    def __init__(self, config, max_budget=1024, device=None, on_chip_layers=0, ssl=0):
-        self.config = config
-        self.world_size = self.config.world_size
-        self.local_rank = self.config.local_rank
-        self.device  = device
-        self.ssl = ssl
-        self.ssl_cur = 0
-        self.max_budget = max_budget
-        self.hidden_size = self.config.hidden_size
-        self.num_heads = self.config.num_key_value_heads // self.world_size
-        
-        self.head_dim = self.hidden_size // self.config.num_attention_heads
-        self.layers = self.config.num_hidden_layers
-        
-        self.seq_len = 0
-        dtype=torch.float16
-        self.on_chip_layers = on_chip_layers
-
-        self.key_cache = torch.zeros([self.on_chip_layers, 1, self.max_budget, self.num_heads, self.head_dim], dtype=dtype, device=device)
-        self.value_cache = torch.zeros([self.on_chip_layers, 1, self.max_budget, self.num_heads, self.head_dim], dtype=dtype, device=device)
-
-        self.cpu_key_cache=torch.zeros([self.layers-self.on_chip_layers, 1, self.max_budget, self.num_heads, self.head_dim], dtype=dtype, device='cpu', pin_memory=True)
-        self.cpu_value_cache=torch.zeros([self.layers-self.on_chip_layers, 1, self.max_budget, self.num_heads, self.head_dim], dtype=dtype, device='cpu', pin_memory=True)
-
-    def print_status(self):
-        print("Cached Size:", self.seq_len, "| Max Budget:", self.max_budget)
-
-    def reset(self):
-        self.seq_len = 0
-        self.cpu_key_cache.zero_()
-        self.cpu_value_cache.zero_()
-        self.key_cache.zero_()
-        self.value_cache.zero_()
-
-    def normal_(self, seq_len=1024*127):
-        self.seq_len = seq_len
-        self.cpu_key_cache.normal_()
-        self.cpu_value_cache.normal_()
-        self.key_cache.normal_()
-        self.value_cache.normal_()
-
-    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int,) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert layer_idx + 1 <= self.on_chip_layers, (layer_idx, self.on_chip_layers)
-        self.key_cache[layer_idx][:, self.seq_len : self.seq_len + key_states.shape[1]] = key_states.clone()
-        self.value_cache[layer_idx][:, self.seq_len : self.seq_len + value_states.shape[1]] = value_states.clone()
-
-        key = self.key_cache[layer_idx][:, :self.seq_len + value_states.shape[1]]
-        value = self.value_cache[layer_idx][:, :self.seq_len + value_states.shape[1]]
-
-        return key, value
-
-    def ssl_update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int,) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert layer_idx + 1 <= self.ssl, (layer_idx, self.ssl)
-        self.key_cache[layer_idx][:, self.seq_len+self.ssl_cur : self.seq_len+self.ssl_cur + key_states.shape[1]] = key_states.clone()
-        self.value_cache[layer_idx][:, self.seq_len+self.ssl_cur : self.seq_len+self.ssl_cur + value_states.shape[1]] = value_states.clone()
-
-        key = self.key_cache[layer_idx][:, :self.seq_len+self.ssl_cur + value_states.shape[1]]
-        value = self.value_cache[layer_idx][:, :self.seq_len+self.ssl_cur + value_states.shape[1]]
-
-        if layer_idx == self.ssl - 1:
-            self.ssl_cur += key_states.shape[1]
-
-        return key, value
-
-    def gather_kv_incremental(self, indices: list[int], offset:int):
-        indices = [i + offset for i in indices]
-
-        self.key_cache[:,:, offset:offset + len(indices)].copy_(self.key_cache[:,:, indices].clone(), non_blocking=True)
-        self.value_cache[:,:, offset:offset + len(indices)].copy_(self.value_cache[:,:, indices].clone(), non_blocking=True)
-
-        self.cpu_key_cache[:, :, offset:offset + len(indices)].copy_(self.cpu_key_cache[:, :, indices].clone(), non_blocking=True)
-        self.cpu_value_cache[:, :, offset:offset + len(indices)].copy_(self.cpu_value_cache[:, :, indices].clone(), non_blocking=True)
-
-        self.seq_len = offset + len(indices)
-        self.ssl_cur = 0
-
-    def copy_back_from_buffer(self, kv_buffer, layer_idx:int):
-        self.cpu_key_cache[layer_idx-self.on_chip_layers][:,self.seq_len: kv_buffer.seq_len].copy_(kv_buffer.key_cache[:, self.seq_len: kv_buffer.seq_len], non_blocking=True)
-        self.cpu_value_cache[layer_idx-self.on_chip_layers][:,self.seq_len: kv_buffer.seq_len].copy_(kv_buffer.value_cache[:, self.seq_len: kv_buffer.seq_len], non_blocking=True)
-
-        if layer_idx == self.layers - 1:
-            self.seq_len = kv_buffer.seq_len
-            self.ssl_cur = 0
-
-class DistributedKVCacheBuffer:
-    def __init__(self, config, max_budget=1024, device=None) -> None:
-
-        self.config = config
-        self.max_budget = max_budget
-        self.device = device
-        self.dtype = torch.float16
-
-        self.world_size = config.world_size
-        self.local_rank = config.local_rank
-
-        self.num_hidden_layers = config.num_hidden_layers
-        self.num_heads = config.num_key_value_heads // self.world_size
-        self.head_dim = config.hidden_size // config.num_attention_heads
-
-        self.key_cache = torch.zeros(1, self.max_budget, self.num_heads, self.head_dim, device=self.device,dtype=self.dtype)
-        self.value_cache = torch.zeros(1, self.max_budget, self.num_heads, self.head_dim, device=self.device,dtype=self.dtype)
-        self.seq_len = 0
-
-    def copy_kv(self, kv_cache, layer_idx):
-        on_chip_layers = kv_cache.on_chip_layers
-        self.key_cache[:,:kv_cache.seq_len].copy_(kv_cache.cpu_key_cache[layer_idx-on_chip_layers][:,:kv_cache.seq_len], non_blocking=True)
-        self.value_cache[:,:kv_cache.seq_len].copy_(kv_cache.cpu_value_cache[layer_idx-on_chip_layers][:,:kv_cache.seq_len], non_blocking=True)
-        self.seq_len = kv_cache.seq_len
-
-    def update(self, key_states :torch.Tensor, value_states :torch.Tensor, layer_idx :int):
-        input_length = key_states.shape[1]
-        self.key_cache[:,self.seq_len:self.seq_len + input_length] = key_states
-        self.value_cache[:,self.seq_len:self.seq_len + input_length] = value_states
-        self.seq_len += input_length
-        return self.key_cache[:,:self.seq_len], self.value_cache[:,:self.seq_len]
-
-class DistributedRetrievalCache_Seqouia:
-
-    def __init__(self, config, max_budget=1024, device=None, prefill=1024, chunk_size=8, tree_size=128) -> None:
-
-        self.config = config
-        self.world_size = self.config.world_size
-        self.local_rank = self.config.local_rank
-        self.device  = device
-        
-        self.hidden_size = self.config.hidden_size
-        self.num_heads = self.config.num_key_value_heads // self.world_size
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.head_dim = self.hidden_size // config.num_attention_heads
-        self.layers = self.config.num_hidden_layers
-
-        self.chunk_size = chunk_size
-        self.prefill = prefill
-        self.chunks = prefill // self.chunk_size
-        self.select_sets = max_budget // self.chunk_size
-        self.tree_size = tree_size
-        self.max_budget = max_budget
-        assert prefill % self.chunk_size == 0, f"prefill should be multiple of chunk_size, got {prefill} % {self.chunk_size}"
-        assert max_budget % self.chunk_size == 0, f"max_budget should be multiple of chunk_size, got {max_budget} % {self.chunk_size}"
-        self.real_budget = max_budget + tree_size
-        self.init_graph = False
-        self.device=device
-        dtype=torch.float16
-        self.key_cache=torch.zeros([self.layers, 1, self.real_budget, self.num_heads, self.head_dim], dtype=dtype).to(device)
-        self.value_cache=torch.zeros([self.layers, 1, self.real_budget, self.num_heads, self.head_dim], dtype=dtype).to(device)
-
-    def print_status(self):
-        print("Budget:", self.max_budget, " | Real Budget:", self.real_budget, " | PreFill:", self.prefill, " | Chunk Size:", self.chunk_size, " | Chunks:", self.chunks, " | Select Sets:", self.select_sets)
-
-    def init_graph_cache(self, kv_cache, query_states, layer_idx):
-
-        if self.init_graph == True:
-            raise ValueError("Graph is already initialized")
-        assert 1 == query_states.shape[1], "query_states should be 1 for init"
-
-        if hasattr(kv_cache, 'cpu_key_cache'):
-            key_cache = kv_cache.key_cache[layer_idx]
-            value_cache = kv_cache.value_cache[layer_idx]
-        else:
-            key_cache = kv_cache.key_cache
-            value_cache = kv_cache.value_cache
-
-        # chunk_k: (bsz, chunks, chunk_size, kv_heads, head_dim) --> (bsz, chunks, kv_heads, head_dim)
-        chunk_k = key_cache[:,:self.prefill].view(1, self.chunks, self.chunk_size, self.num_heads, self.head_dim).mean(dim=-3)
-        chunk_attn = torch.matmul(query_states.permute(0, 2, 1, 3), chunk_k.permute(0, 2, 3, 1)).squeeze(2) # (bsz, 32, chunks)
-        _, topk_idx_rest = torch.topk(chunk_attn[:, :, 1:], k=self.select_sets-1, dim=-1) # (bsz, 32, select_sets) --> (bsz, select_sets, 32)
-        topk_idx_rest += 1
-        topk_idx_first = torch.zeros((topk_idx_rest.shape[0], topk_idx_rest.shape[1], 1), device=topk_idx_rest.device, dtype=topk_idx_rest.dtype)
-        topk_idx = torch.cat([topk_idx_first, topk_idx_rest], dim=-1)  # (bsz, 32, select_sets)
-        expanded_index_tensor = topk_idx.permute(0, 2, 1).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, self.chunk_size, self.head_dim)
-
-        # (bsz, prefill, 32, head_dim) --> (bsz, chunks, chunk_size, 32, head_dim) --> (bsz, chunks, 32, chunk_size, head_dim)
-        key_ = key_cache[:, :self.prefill].reshape(1, self.chunks, self.chunk_size, self.num_heads, self.head_dim)
-        key_ = key_.permute(0, 1, 3, 2, 4)
-        result_tensor = torch.gather(key_, 1, expanded_index_tensor) # (bsz, select_sets, 32, chunk_size, head_dim)
-        # (bsz, select_sets, 32, chunk_size, head_dim) --> (bsz, select_sets*chunk_size, 32, head_dim)
-        self.key_cache[layer_idx][:,:self.max_budget] = result_tensor.permute(0, 1, 3, 2, 4).reshape(1, self.select_sets*self.chunk_size, self.num_heads, self.head_dim).clone()
-
-        value_ = value_cache[:, :self.prefill].reshape(1, self.chunks, self.chunk_size, self.num_heads, self.head_dim)
-        value_ = value_.permute(0, 1, 3, 2, 4)
-        result_tensor = torch.gather(value_, 1, expanded_index_tensor)
-        self.value_cache[layer_idx][:,:self.max_budget] = result_tensor.permute(0, 1, 3, 2, 4).reshape(1, self.select_sets*self.chunk_size, self.num_heads, self.head_dim).clone()
-
-        if layer_idx == self.layers-1:
-            self.init_graph = True
-
-
-    def update(self, key_states :torch.Tensor, value_states :torch.Tensor, layer_idx :int, storage_ids):
-        input_length = len(storage_ids)
-        assert input_length == key_states.shape[1]
-        assert input_length == value_states.shape[1]
-
-        self.key_cache[layer_idx].index_copy_(dim=1, index=storage_ids, source=key_states)
-        self.value_cache[layer_idx].index_copy_(dim=1, index=storage_ids, source=value_states)
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
-
-    def update_graph_cache(self, kv_cache=None):
-
-        # on-chip layers
-        on_chip_layers = kv_cache.on_chip_layers
-        self.value_cache[:on_chip_layers,:,self.max_budget-(kv_cache.seq_len-self.prefill):self.max_budget].copy_(kv_cache.value_cache[:,:,self.prefill:kv_cache.seq_len], non_blocking=True)
-        self.key_cache[:on_chip_layers,:,self.max_budget-(kv_cache.seq_len-self.prefill):self.max_budget].copy_(kv_cache.key_cache[:,:,self.prefill:kv_cache.seq_len], non_blocking=True)
-
-        # cpu layers
-        self.value_cache[on_chip_layers:,:,self.max_budget-(kv_cache.seq_len-self.prefill):self.max_budget].copy_(kv_cache.cpu_value_cache[:,:,self.prefill:kv_cache.seq_len], non_blocking=True)
-        self.key_cache[on_chip_layers:,:,self.max_budget-(kv_cache.seq_len-self.prefill):self.max_budget].copy_(kv_cache.cpu_key_cache[:,:,self.prefill:kv_cache.seq_len], non_blocking=True)
-
-    def reset(self):
-        self.key_cache.zero_()
-        self.value_cache.zero_()
-        self.init_graph = False
-
-    def normal_(self):
-        self.key_cache.normal_()
-        self.value_cache.normal_()
-
-class DistributedRetrievalCache:
-    def __init__(self, config, max_budget=1024, device=None, prefill=1024, chunk_size=8, gamma=6) -> None:
-
-        self.config = config
-        self.world_size = self.config.world_size
-        self.local_rank = self.config.local_rank
-        self.device  = device
-        
-        self.hidden_size = self.config.hidden_size
-        self.num_heads = self.config.num_key_value_heads // self.world_size
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.head_dim = self.hidden_size // config.num_attention_heads
-        self.layers = self.config.num_hidden_layers
-
-        self.chunk_size = chunk_size
-        self.prefill = prefill
-        self.chunks = prefill // self.chunk_size
-        self.select_sets = max_budget // self.chunk_size
-        self.gamma = gamma
-        self.max_budget = max_budget
-        assert prefill % self.chunk_size == 0, f"prefill should be multiple of chunk_size, got {prefill} % {self.chunk_size}"
-        assert max_budget % self.chunk_size == 0, f"max_budget should be multiple of chunk_size, got {max_budget} % {self.chunk_size}"
-        self.real_budget = max_budget + gamma + 1
-        self.init_graph = False
-        self.device=device
-        dtype=torch.float16
-        self.key_cache=torch.zeros([self.layers, 1, self.real_budget, self.num_heads, self.head_dim], dtype=dtype).to(device)
-        self.value_cache=torch.zeros([self.layers, 1, self.real_budget, self.num_heads, self.head_dim], dtype=dtype).to(device)
-
-    def print_status(self):
-        print("Budget:", self.max_budget, " | Real Budget:", self.real_budget, " | PreFill:", self.prefill, " | Chunk Size:", self.chunk_size, " | Chunks:", self.chunks, " | Select Sets:", self.select_sets)
-
-    def init_graph_cache(self, kv_cache, query_states, layer_idx):
-
-        if self.init_graph == True:
-            raise ValueError("Graph is already initialized")
-        assert 1 == query_states.shape[1], "query_states should be 1 for init"
-
-        if hasattr(kv_cache, 'cpu_key_cache'):
-            key_cache = kv_cache.key_cache[layer_idx]
-            value_cache = kv_cache.value_cache[layer_idx]
-        else:
-            key_cache = kv_cache.key_cache
-            value_cache = kv_cache.value_cache
-
-        # chunk_k: (bsz, chunks, chunk_size, kv_heads, head_dim) --> (bsz, chunks, kv_heads, head_dim)
-        chunk_k = key_cache[:,:self.prefill].view(1, self.chunks, self.chunk_size, self.num_heads, self.head_dim).mean(dim=-3)
-        chunk_attn = torch.matmul(query_states.permute(0, 2, 1, 3), chunk_k.permute(0, 2, 3, 1)).squeeze(2) # (bsz, 32, chunks)
-        _, topk_idx_rest = torch.topk(chunk_attn[:, :, 1:], k=self.select_sets-1, dim=-1) # (bsz, 32, select_sets) --> (bsz, select_sets, 32)
-        topk_idx_rest += 1
-        topk_idx_first = torch.zeros((topk_idx_rest.shape[0], topk_idx_rest.shape[1], 1), device=topk_idx_rest.device, dtype=topk_idx_rest.dtype)
-        topk_idx = torch.cat([topk_idx_first, topk_idx_rest], dim=-1)  # (bsz, 32, select_sets)
-        expanded_index_tensor = topk_idx.permute(0, 2, 1).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, self.chunk_size, self.head_dim)
-
-        # (bsz, prefill, 32, head_dim) --> (bsz, chunks, chunk_size, 32, head_dim) --> (bsz, chunks, 32, chunk_size, head_dim)
-        key_ = key_cache[:, :self.prefill].reshape(1, self.chunks, self.chunk_size, self.num_heads, self.head_dim)
-        key_ = key_.permute(0, 1, 3, 2, 4)
-        result_tensor = torch.gather(key_, 1, expanded_index_tensor) # (bsz, select_sets, 32, chunk_size, head_dim)
-        # (bsz, select_sets, 32, chunk_size, head_dim) --> (bsz, select_sets*chunk_size, 32, head_dim)
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        self.key_cache[layer_idx][:,:self.max_budget].copy_(result_tensor.permute(0, 1, 3, 2, 4).reshape(1, self.select_sets*self.chunk_size, self.num_heads, self.head_dim))
-
-        value_ = value_cache[:, :self.prefill].reshape(1, self.chunks, self.chunk_size, self.num_heads, self.head_dim)
-        value_ = value_.permute(0, 1, 3, 2, 4)
-        result_tensor = torch.gather(value_, 1, expanded_index_tensor)
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        self.value_cache[layer_idx][:,:self.max_budget].copy_(result_tensor.permute(0, 1, 3, 2, 4).reshape(1, self.select_sets*self.chunk_size, self.num_heads, self.head_dim))
-
-        if layer_idx == self.layers-1:
-            self.init_graph = True
-
-
-    def update(self, key_states :torch.Tensor, value_states :torch.Tensor, layer_idx :int):
-
-        self.key_cache[layer_idx][:, self.real_budget-self.gamma-1:] = key_states.clone()
-        self.value_cache[layer_idx][:, self.real_budget-self.gamma-1:] = value_states.clone()
-
-        return self.key_cache[layer_idx][:,:self.real_budget], self.value_cache[layer_idx][:,:self.real_budget]
-
-    def update_graph_cache(self, kv_cache=None):
-
-        # on-chip layers
-        on_chip_layers = kv_cache.on_chip_layers
-        self.value_cache[:on_chip_layers,:,self.max_budget-(kv_cache.seq_len-self.prefill):self.max_budget].copy_(kv_cache.value_cache[:,:,self.prefill:kv_cache.seq_len], non_blocking=True)
-        self.key_cache[:on_chip_layers,:,self.max_budget-(kv_cache.seq_len-self.prefill):self.max_budget].copy_(kv_cache.key_cache[:,:,self.prefill:kv_cache.seq_len], non_blocking=True)
-
-        # cpu layers
-        self.value_cache[on_chip_layers:,:,self.max_budget-(kv_cache.seq_len-self.prefill):self.max_budget].copy_(kv_cache.cpu_value_cache[:,:,self.prefill:kv_cache.seq_len], non_blocking=True)
-        self.key_cache[on_chip_layers:,:,self.max_budget-(kv_cache.seq_len-self.prefill):self.max_budget].copy_(kv_cache.cpu_key_cache[:,:,self.prefill:kv_cache.seq_len], non_blocking=True)
-
-    def reset(self):
-        self.key_cache.zero_()
-        self.value_cache.zero_()
-        self.init_graph = False
-
-    def normal_(self):
-        self.key_cache.normal_()
-        self.value_cache.normal_()
+        scale = (maxval - minval)/(2**(bits//2) - 1)
+        ubits = inp - minval.unsqueeze(-2)
+        ubits = ubits / scale.unsqueeze(-2)
+        q_ubits = torch.clip(ubits, min=0, max=2**(bits//2)-1).round().to(torch.int32)
+
+        q_error = ubits - q_ubits
+        lbits = q_error*(2**(bits//2))
+        q_lbits = torch.clip(lbits, min=-2**(bits//2 - 1), max=2**(bits//2 - 1)-1).round().to(torch.int32)
+
+        return q_ubits.reshape(*inp.shape[:-2], -1, inp.shape[-1]), q_lbits.reshape(*inp.shape[:-2], -1, inp.shape[-1]), scale, minval

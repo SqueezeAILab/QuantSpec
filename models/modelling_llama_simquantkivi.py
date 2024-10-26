@@ -108,43 +108,12 @@ class LlamaAttention_SimQuant(LlamaAttention):
             self.k_proj = LinearAct(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=self.config.attention_bias) 
             self.v_proj = LinearAct(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=self.config.attention_bias)
 
-        if self.config.sensitivity is not None:
-            self.scale_factors_to_convert_to_higher_precision()
+        if self.config.mixed_precision is not None:
+            self.k_mixed_bits = self.config.k_mixed_bits
+            self.v_mixed_bits = self.config.v_mixed_bits
         else:
-            self.k_factors = None
-            self.v_factors = None
-    
-    def scale_factors_to_convert_to_higher_precision(self):
-        k_grad_mag = self.config.sensitivity[f'k_proj{self.layer_idx}']
-        v_grad_mag = self.config.sensitivity[f'v_proj{self.layer_idx}']
-        k_threshold = self.config.k_threshold
-        v_threshold = self.config.v_threshold
-
-        k_factors = []
-        v_factors = []
-        for i in range(self.num_heads):
-            sensitivity = np.mean(k_grad_mag) if self.config.per_layer_threshold else k_grad_mag[i//self.num_key_value_groups]
-            if sensitivity<k_threshold:
-                if self.k_bits == 8:
-                    k_factors.append(17*5)
-                elif self.k_bits == 4:
-                    k_factors.append(5)
-                else:
-                    k_factors.append(1)
-            else:
-                k_factors.append(1)
-            sensitivity = np.mean(v_grad_mag) if self.config.per_layer_threshold else v_grad_mag[i//self.num_key_value_groups]
-            if sensitivity<v_threshold:
-                if self.v_bits == 8:
-                    v_factors.append(17*5)
-                elif self.v_bits == 4:
-                    v_factors.append(5)
-                else:
-                    v_factors.append(1)
-            else:
-                v_factors.append(1)
-        self.k_factors = torch.tensor(k_factors).cuda()
-        self.v_factors = torch.tensor(v_factors).cuda()
+            self.k_mixed_bits = None
+            self.v_mixed_bits = None
     
     def forward(
         self,
@@ -207,23 +176,24 @@ class LlamaAttention_SimQuant(LlamaAttention):
             ''' Our Logic Here '''
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             kv_seq_len = kv_cache.seq_len + q_len
-            if kv_cache.seq_len == 0:
-                past_key_value = kv_cache.update_and_quantize_packed(key_states, value_states, layer_idx=self.layer_idx, cache_kwargs=cache_kwargs)
-            else:
-                past_key_value = kv_cache.update(key_states, value_states, layer_idx=self.layer_idx, cache_kwargs=cache_kwargs)
-            key_states_quant_trans = repeat_kv(past_key_value[0], self.num_key_value_groups)
-            key_states_full = repeat_kv(past_key_value[1], self.num_key_value_groups)
-            key_scale_trans = repeat_kv(past_key_value[2], self.num_key_value_groups)
-            key_mn_trans = repeat_kv(past_key_value[3], self.num_key_value_groups)
-            value_states_quant = repeat_kv(past_key_value[4], self.num_key_value_groups)
+            past_key_value = kv_cache.update(key_states, value_states, layer_idx=self.layer_idx, cache_kwargs=cache_kwargs)
+    
+            key_states_full = repeat_kv(past_key_value[0], self.num_key_value_groups)
+            key_states_quant_ubits = repeat_kv(past_key_value[1], self.num_key_value_groups)
+            key_states_quant_lbits = repeat_kv(past_key_value[2], self.num_key_value_groups)
+            key_scale = repeat_kv(past_key_value[3], self.num_key_value_groups)
+            key_min = repeat_kv(past_key_value[4], self.num_key_value_groups)
+
             value_states_full = repeat_kv(past_key_value[5], self.num_key_value_groups)
-            value_scale = repeat_kv(past_key_value[6], self.num_key_value_groups)
-            value_mn = repeat_kv(past_key_value[7], self.num_key_value_groups)
+            trans_value_states_quant_ubits = repeat_kv(past_key_value[6], self.num_key_value_groups)
+            trans_value_states_quant_lbits = repeat_kv(past_key_value[7], self.num_key_value_groups)
+            trans_value_scale = repeat_kv(past_key_value[8], self.num_key_value_groups)
+            trans_value_min = repeat_kv(past_key_value[9], self.num_key_value_groups)
 
  
-            if key_states_quant_trans is not None:
-                att_qkquant = sim_cuda_bmm_fA_qB_outer(self.group_size, query_states, key_states_quant_trans, 
-                                key_scale_trans, key_mn_trans, self.k_bits, self.k_factors)
+            if key_scale is not None:
+                att_qkquant = sim_cuda_bmm_fA_qB_outer(self.group_size, query_states, key_states_quant_ubits.transpose(2, 3), key_states_quant_lbits.transpose(2, 3), 
+                                key_scale.transpose(2, 3), key_min.transpose(2, 3), self.k_bits, self.k_mixed_bits)
             else:
                 att_qkquant = None
             att_qkfull = torch.matmul(query_states, key_states_full.transpose(2, 3))
@@ -328,17 +298,19 @@ class LlamaAttention_SimQuant(LlamaAttention):
 #     out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 #     return out
 
-def sim_cuda_bmm_fA_qB_outer(group_size, fA, qB, scale, mn, bits, factors):
+def sim_cuda_bmm_fA_qB_outer(group_size, fA, quB, qlB, scale, mn, bits, mixed_bits):
     # fA is of shape (B, nh, M, K) float16
 	# qB is of shape (B, nh, K, N) int32
     # scales is of shape (B, nh, K, G) float16
 	# zeros is of shape (B, nh, K, G) float16
     # bits: int
     # factors: (nh) float16
-    num_groups = qB.size(-1) // group_size
-    num_heads = qB.size(1)
-    B = qB.reshape(*qB.shape[:-1], num_groups, group_size).half()
-    if factors is not None:
+    
+    num_groups = quB.size(-1) // group_size
+    num_heads = quB.size(1)
+    Bu = quB.reshape(*quB.shape[:-1], num_groups, group_size)
+    Bl = qlB.reshape(*qlB.shape[:-1], num_groups, group_size)
+    if mixed_bits is not None:
         factors = factors.view(1, num_heads, 1, 1, 1)
         B = (B/factors).round()*factors
     B = B*scale.unsqueeze(-1)+ mn.unsqueeze(-1)
