@@ -399,6 +399,7 @@ class QCache(Cache, torch.nn.Module):
         print("[Full Cache] Cached:", self.seq_len.item(), "| Quantized:", self.quant_key_len.item(), self.quant_val_len.item(), "| full_precision:", self.seq_len.item()-self.quant_key_len.item(), self.seq_len.item()-self.quant_val_len.item())
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs):
+        # 1, nh, seq_len, head_dim
         if layer_idx < self.first_few_fp16_layers:
             self.full_key_cache_fp16[layer_idx][:, :, self.seq_len:self.seq_len+key_states.shape[-2]].copy_(key_states)
             self.full_value_cache_fp16[layer_idx][:, :, self.seq_len:self.seq_len+value_states.shape[-2]].copy_(value_states)
@@ -492,7 +493,7 @@ class QCache(Cache, torch.nn.Module):
             for layer_idx in range(self.layers-self.first_few_fp16_layers):
                 to_quant_value_states = self.full_value_cache[layer_idx][:, :, :to_quant_len]
                 value_states_quant_ubits, value_states_quant_lbits, value_scale, value_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(to_quant_value_states.transpose(2,3).contiguous(), self.group_size, self.v_bits)
-                self.full_value_cache[layer_idx][:, :, :full_val_len-to_quant_len].copy_(self.full_value_cache[layer_idx][:, :, to_quant_len:full_val_len].clone())
+                self.full_value_cache[layer_idx][:, :, :full_val_len-to_quant_len].copy_(self.full_value_cache[layer_idx][:, :, to_quant_len:full_val_len])
 
                 self.trans_quantize_value_cache_ubits[layer_idx][:, :, :, self.quant_val_len//(8//self.v_bits):(self.quant_val_len+to_quant_len)//(8//self.v_bits)].copy_(value_states_quant_ubits)
                 self.trans_quantize_value_cache_lbits[layer_idx][:, :, :, self.quant_val_len//(8//self.v_bits):(self.quant_val_len+to_quant_len)//(8//self.v_bits)].copy_(value_states_quant_lbits)
