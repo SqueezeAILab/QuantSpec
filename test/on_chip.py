@@ -10,13 +10,13 @@ from transformers import AutoTokenizer
 from termcolor import colored
 from tqdm import tqdm
 from data.dataset import get_dataset
-from models.modelling_llama_simquantkivi import LlamaForCausalLM_SimQuant
+from models.modelling_llama_simquantkv import LlamaForCausalLM_SimQuant
+from models.modelling_llama_quantkv import LlamaForCausalLM_Quant
 from models.cache import QCache, SimQCacheV2
 from utils.decoding import SimQuantSpecDecode
 from utils.misc import print_config, log_csv, seed_everything
 from utils.graph_infer import GraphInferenceEngine
 from transformers import AutoTokenizer, LlamaConfig
-from models.modelling_llama_kivi  import LlamaForCausalLM_KIVI445
 import numpy as np
 import copy
 seed_everything(43)
@@ -123,8 +123,8 @@ if __name__ == "__main__":
         draft_class = LlamaForCausalLM_SimQuant
         target_class = LlamaForCausalLM_SimQuant
     else:
-        draft_class = LlamaForCausalLM_KIVI445
-        target_class = LlamaForCausalLM_KIVI445
+        draft_class = LlamaForCausalLM_Quant
+        target_class = LlamaForCausalLM_Quant
     draft = draft_class.from_pretrained(
     pretrained_model_name_or_path=args.draft,
     config=config,
@@ -173,7 +173,7 @@ if __name__ == "__main__":
         target_cache = SimQCacheV2(target, max_budget=prefill+gen_len+16)
     else:
         target_cache = QCache(target, max_budget=prefill+gen_len+16)
-        draft_cache = target_cache
+        draft_cache = QCache(draft, max_budget=prefill+gen_len+16)
     
     spec_engine = GraphInferenceEngine(target, target_cache, draft, draft_cache)
 

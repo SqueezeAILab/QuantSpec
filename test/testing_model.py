@@ -9,9 +9,9 @@ import torch
 from transformers import AutoTokenizer, LlamaConfig
 from tqdm import tqdm
 from data.dataset import get_dataset
-from models.modelling_llama_simquantkivi import LlamaForCausalLM_KIVI445 as LlamaForCausalLM_SimKIVI445
+from models.modelling_llama_simquantkv import LlamaForCausalLM_KIVI445 as LlamaForCausalLM_SimKIVI445
 from models.cache import QCache, SimQCache
-from models.modelling_llama_kivi import LlamaForCausalLM_KIVI445
+from models.modelling_llama_quantkv import LlamaForCausalLM_KIVI445
 from utils.misc import seed_everything
 import torch.nn as nn
 import argparse
