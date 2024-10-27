@@ -134,10 +134,10 @@ def QuantSpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, top_k
         speculation_probs = []
         for i in range(gamma):
             # print(i)
-            # spec_engine.engine.draft_cache.seq_len -= i
-            # logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,:i+1])
+            spec_engine.engine.draft_cache.seq_len -= i
+            logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,:i+1])
             # spec_engine.engine.draft_cache.print_status()
-            logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,i:i+1])
+            # logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,i:i+1])
             prob = norm_logits(logits_[:,-1,:], temperature=temperature ,top_k=top_k, top_p=top_p).squeeze()
             speculation_probs.append(prob)
             next_token = sample(prob)

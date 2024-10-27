@@ -27,15 +27,15 @@ class InferenceEngine:
 
     @torch.inference_mode()
     def target_run(self, input_ids: torch.LongTensor):
-        if input_ids.shape[-1] > 4096: # prefill
-            iter_prefill = math.ceil(input_ids.shape[1] / 4096)
-            for i in range(iter_prefill):
-                logits = self.target(
-                    input_ids=input_ids[:, i*4096:(i+1)*4096],
-                    kv_cache=self.target_cache,
-                ).logits
-        else: # verification
-            logits = self.target(input_ids=input_ids, kv_cache=self.target_cache).logits
+        # if input_ids.shape[-1] > 4096: # prefill
+        #     iter_prefill = math.ceil(input_ids.shape[1] / 4096)
+        #     for i in range(iter_prefill):
+        #         logits = self.target(
+        #             input_ids=input_ids[:, i*4096:(i+1)*4096],
+        #             kv_cache=self.target_cache,
+        #         ).logits
+        # else: # verification
+        logits = self.target(input_ids=input_ids, kv_cache=self.target_cache).logits
         return logits
 
     @torch.inference_mode()
