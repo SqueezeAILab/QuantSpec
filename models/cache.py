@@ -252,16 +252,20 @@ class SimQCacheV2(Cache, torch.nn.Module):
         maxval = torch.max(inp, dim=-2).values
         minval = torch.min(inp, dim=-2).values
         scale = (maxval - minval)/(2**(bits) - 1)
+        scale_lower = scale/(2**(bits))
         ubits = inp - minval.unsqueeze(-2)
         ubits = ubits / scale.unsqueeze(-2)
         q_ubits = torch.clip(ubits, min=0, max=2**(bits)-1).round().to(torch.int32)
+
+        # lbits = inp - (q_ubits*scale.unsqueeze(-2) + minval.unsqueeze(-2))
+        # lbits = lbits / scale_lower.unsqueeze(-2)
+        # q_lbits = torch.clip(lbits, min=-2**(bits - 1), max=2**(bits - 1)-1).round().to(torch.int32)
 
         q_error = ubits - q_ubits
         lbits = q_error*(2**(bits))
         q_lbits = torch.clip(lbits, min=-2**(bits - 1), max=2**(bits - 1)-1).round().to(torch.int32)
 
         return q_ubits.reshape(*inp.shape[:-3], -1, inp.shape[-1]), q_lbits.reshape(*inp.shape[:-3], -1, inp.shape[-1]), scale, minval
-    
 class QCache(Cache, torch.nn.Module):
     def __init__(self, model, max_budget=1024) -> None:
         super().__init__()
@@ -430,8 +434,8 @@ class QCache(Cache, torch.nn.Module):
                     self.full_key_cache[layer_idx][:, :, :prefill_len-to_quant_len].copy_(key_states[:, :, to_quant_len:].clone())
                     self.full_value_cache[layer_idx][:, :, :prefill_len-to_quant_len].copy_(value_states[:, :, to_quant_len:].clone())
 
-                key_states_quant_ubits, key_states_quant_lbits, key_scale, key_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(key_states[:, :, :to_quant_len], self.group_size, self.k_bits)
-                value_states_quant_ubits, value_states_quant_lbits, value_scale, value_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(value_states[:, :, :to_quant_len].transpose(2,3).contiguous(), self.group_size, self.v_bits)
+                key_states_quant_ubits, key_states_quant_lbits, key_scale, key_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(key_states[:, :, :to_quant_len].clone(), self.group_size, self.k_bits)
+                value_states_quant_ubits, value_states_quant_lbits, value_scale, value_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(value_states[:, :, :to_quant_len].clone().transpose(2,3).contiguous(), self.group_size, self.v_bits)
                 self.quantize_key_cache_ubits[layer_idx][:, :, :to_quant_len].copy_(key_states_quant_ubits)
                 self.quantize_key_cache_lbits[layer_idx][:, :, :to_quant_len].copy_(key_states_quant_lbits)
                 self.trans_quantize_value_cache_ubits[layer_idx][:, :, :, :to_quant_len//(8//self.v_bits)].copy_(value_states_quant_ubits)
@@ -476,7 +480,7 @@ class QCache(Cache, torch.nn.Module):
             to_quant_len = full_key_len-self.residual_length-(full_key_len%self.residual_length)
             for layer_idx in range(self.layers-self.first_few_fp16_layers):
                 to_quant_key_states = self.full_key_cache[layer_idx][:, :, :to_quant_len]
-                key_states_quant_ubits, key_states_quant_lbits, key_scale, key_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(to_quant_key_states, self.group_size, self.k_bits)
+                key_states_quant_ubits, key_states_quant_lbits, key_scale, key_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(to_quant_key_states.clone(), self.group_size, self.k_bits)
                 self.full_key_cache[layer_idx][:, :, :full_key_len-to_quant_len].copy_(self.full_key_cache[layer_idx][:, :, to_quant_len:full_key_len].clone())
 
                 self.quantize_key_cache_ubits[layer_idx][:, :, self.quant_key_len:(self.quant_key_len+to_quant_len)].copy_(key_states_quant_ubits)
@@ -492,7 +496,7 @@ class QCache(Cache, torch.nn.Module):
             to_quant_len = full_val_len-self.residual_length-(full_val_len%self.residual_length)
             for layer_idx in range(self.layers-self.first_few_fp16_layers):
                 to_quant_value_states = self.full_value_cache[layer_idx][:, :, :to_quant_len]
-                value_states_quant_ubits, value_states_quant_lbits, value_scale, value_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(to_quant_value_states.transpose(2,3).contiguous(), self.group_size, self.v_bits)
+                value_states_quant_ubits, value_states_quant_lbits, value_scale, value_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(to_quant_value_states.clone().transpose(2,3).contiguous(), self.group_size, self.v_bits)
                 self.full_value_cache[layer_idx][:, :, :full_val_len-to_quant_len].copy_(self.full_value_cache[layer_idx][:, :, to_quant_len:full_val_len])
 
                 self.trans_quantize_value_cache_ubits[layer_idx][:, :, :, self.quant_val_len//(8//self.v_bits):(self.quant_val_len+to_quant_len)//(8//self.v_bits)].copy_(value_states_quant_ubits)

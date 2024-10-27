@@ -10,23 +10,25 @@ def _fwd_kernel_int8kv_upperlower_flash_decode_stage1(
     sm_scale,
     Mid_O, # [batch, head, seq_block_num, head_dim]
     Mid_O_LogExpSum, #[batch, head, seq_block_num]
-    stride_qbs, stride_qh, stride_qd,
+    stride_qbs, stride_qh, stride_qseq, stride_qd,
     stride_quant_kbs, stride_quant_kh, stride_quant_ks, # Batch Size, Head, Sequence
     stride_scale_kbs, stride_scale_kh, stride_scale_ks, # Scale and Min should share this stride
     stride_quant_vbs, stride_quant_vh, stride_quant_vd, # Batch Size, Head, head Dim
     stride_scale_vbs, stride_scale_vh, stride_scale_vd, # Scale and Min should share this stride
-    stride_mid_ob, stride_mid_oh, stride_mid_os, stride_mid_od,
-    stride_mid_o_eb, stride_mid_o_eh, stride_mid_o_es,
+    stride_mid_ob, stride_mid_oh, stride_mid_oqseq, stride_mid_os, stride_mid_od,
+    stride_mid_o_eb, stride_mid_o_eh, stride_mid_o_eqseq, stride_mid_o_es,
     kbit: tl.constexpr, vbit: tl.constexpr,
     group_size: tl.constexpr,
     elem_per_int: tl.constexpr,
     gqa_group_size,
+    cur_qseq: tl.constexpr,
     BLOCK_SEQ: tl.constexpr, 
     BLOCK_SEQ_PER_INT: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DMODEL_PER_INT: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_N_PER_INT: tl.constexpr
+    BLOCK_N_PER_INT: tl.constexpr,
+    precision: tl.constexpr
 ):
     tl.static_assert(kbit == vbit, "kbit and vbit should be the same")
     cur_batch = tl.program_id(0)
@@ -49,7 +51,7 @@ def _fwd_kernel_int8kv_upperlower_flash_decode_stage1(
     cur_seq_start_index_scale_v = seq_start_block * BLOCK_SEQ
 
     # Query states offset
-    off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_q_d
+    off_q = cur_batch * stride_qbs + cur_head * stride_qh + cur_qseq * stride_qseq + offs_q_d
     # Key and Value offset
     off_quant_kbh = cur_batch * stride_quant_kbs + cur_head * stride_quant_kh # Index of current Batch and Head
     off_quant_vbh = cur_batch * stride_quant_vbs + cur_head * stride_quant_vh # Index of current Batch and Head
@@ -105,7 +107,10 @@ def _fwd_kernel_int8kv_upperlower_flash_decode_stage1(
         # k = tl.reshape(k, (BLOCK_N // group_size, group_size, BLOCK_DMODEL))
         # scale_k = tl.reshape(scale_k, (BLOCK_N // group_size, 1, BLOCK_DMODEL))
         # min_k = tl.reshape(min_k, (BLOCK_N // group_size, 1, BLOCK_DMODEL))
-        k = (up_k * scale_k + (low_k - 8) * low_scale_k) + min_k
+        if precision == 8:
+            k = (up_k * scale_k + (low_k - 8) * low_scale_k) + min_k
+        else:
+            k = (up_k * scale_k) + min_k
         # k = tl.reshape(k, (BLOCK_N, BLOCK_DMODEL))
 
         att_value = tl.sum(q[None, :] * k, 1)
@@ -123,18 +128,23 @@ def _fwd_kernel_int8kv_upperlower_flash_decode_stage1(
         
         up_v_int8_low = (quant_v_upper & 0xF)
         up_v_int8_high = ((quant_v_upper & 0xF0) >> 4)
-        up_v = tl.interleave(up_v_int8_low, up_v_int8_high).to(tl.float16)
+        up_v = tl.interleave(up_v_int8_low, up_v_int8_high)
         
         low_v_int8_low = (quant_v_lower & 0xF)
         low_v_int8_high = ((quant_v_lower & 0xF0) >> 4)
-        low_v = tl.interleave(low_v_int8_low, low_v_int8_high).to(tl.float16)
+        low_v = tl.interleave(low_v_int8_low, low_v_int8_high)
 
         low_scale_v = scale_v / (2 ** vbit)
+
+        # tl.static_print(up_v, scale_v, low_v, low_scale_v)
 
         # v = tl.reshape(v, (BLOCK_DMODEL // group_size, group_size, BLOCK_N))
         # scale_v = tl.reshape(scale_v, (BLOCK_DMODEL // group_size, 1, BLOCK_N))
         # min_v = tl.reshape(min_v, (BLOCK_DMODEL // group_size, 1, BLOCK_N))
-        v = (up_v * scale_v + (low_v - 8) * low_scale_v) + min_v
+        if precision == 8:
+            v = (up_v * scale_v + (low_v - 8) * low_scale_v) + min_v
+        else:
+            v = (up_v * scale_v) + min_v
         # v = tl.reshape(v, (BLOCK_DMODEL, BLOCK_N))
         
         cur_max_logic = tl.max(att_value, axis=0)
@@ -148,8 +158,8 @@ def _fwd_kernel_int8kv_upperlower_flash_decode_stage1(
         sum_exp = sum_exp * logic_scale + tl.sum(exp_logic, axis=0)
         max_logic = new_max_logic
 
-    off_mid_o = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + seq_start_block * stride_mid_os + offs_q_d # offset_d is renamed
-    off_mid_o_logexpsum = cur_batch * stride_mid_o_eb + cur_head * stride_mid_o_eh + seq_start_block
+    off_mid_o = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + cur_qseq * stride_mid_oqseq + seq_start_block * stride_mid_os + offs_q_d # offset_d is renamed
+    off_mid_o_logexpsum = cur_batch * stride_mid_o_eb + cur_head * stride_mid_o_eh + cur_qseq * stride_mid_o_eqseq + seq_start_block
     tl.store(Mid_O + off_mid_o, acc / sum_exp)
     tl.store(Mid_O_LogExpSum + off_mid_o_logexpsum, max_logic + tl.log(sum_exp))
 
@@ -171,7 +181,9 @@ def int8kv_upperlower_flash_decode_stage1(
     kbit, 
     vbit, 
     group_size,
-    elem_per_int):
+    elem_per_int,
+    precision
+):
     """
     q : torch.Tensor
         The query tensor of shape (batch_size, num_heads, 1, head_dim). It represents 
@@ -225,35 +237,39 @@ def int8kv_upperlower_flash_decode_stage1(
     grid = (batch, head_num, triton.cdiv(max_len_in_batch, BLOCK_SEQ))
     gqa_group_size = q.shape[1] // cache_quant_k_upper.shape[1]
 
+    q_seq_len = q.shape[2]
     # import IPython
     # IPython.embed()
 
-    asm = _fwd_kernel_int8kv_upperlower_flash_decode_stage1[grid](
-        q, 
-        cache_quant_k_upper, cache_quant_k_lower, cache_scale_k, cache_min_k, 
-        cache_quant_v_upper, cache_quant_v_lower, cache_scale_v, cache_min_v,
-        sm_scale,
-        mid_out,
-        mid_out_logsumexp,
-        q.stride(0), q.stride(1), q.stride(2),
-        cache_quant_k_upper.stride(0), cache_quant_k_upper.stride(1), cache_quant_k_upper.stride(2),
-        cache_scale_k.stride(0), cache_scale_k.stride(1), cache_scale_k.stride(2), # Scale and Min should share this stride since they are of same shape
-        cache_quant_v_upper.stride(0), cache_quant_v_upper.stride(1), cache_quant_v_upper.stride(2),
-        cache_scale_v.stride(0), cache_scale_v.stride(1), cache_scale_v.stride(2), # Scale and Min should share this stride since they are of same shape
-        mid_out.stride(0), mid_out.stride(1), mid_out.stride(2), mid_out.stride(3),
-        mid_out_logsumexp.stride(0), mid_out_logsumexp.stride(1), mid_out_logsumexp.stride(2),
-        kbit, vbit,
-        group_size,
-        elem_per_int,
-        gqa_group_size,
-        BLOCK_SEQ=BLOCK_SEQ, # How many int2/int4 elements a block should load
-        BLOCK_SEQ_PER_INT=BLOCK_SEQ_PER_INT, # How many int32 elements a block should load
-        BLOCK_DMODEL=Lk,
-        BLOCK_DMODEL_PER_INT=Lk_PER_INT,
-        BLOCK_N=BLOCK_N, # How many int2/int4 elements a sub-block should load
-        BLOCK_N_PER_INT=BLOCK_N_PER_INT, # How many int32 elements a sub-block should load
-        num_warps=8,
-        num_stages=4,
-    )
+    for q_idx in range(q_seq_len):
+        asm = _fwd_kernel_int8kv_upperlower_flash_decode_stage1[grid](
+            q, 
+            cache_quant_k_upper, cache_quant_k_lower, cache_scale_k, cache_min_k, 
+            cache_quant_v_upper, cache_quant_v_lower, cache_scale_v, cache_min_v,
+            sm_scale,
+            mid_out,
+            mid_out_logsumexp,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            cache_quant_k_upper.stride(0), cache_quant_k_upper.stride(1), cache_quant_k_upper.stride(2),
+            cache_scale_k.stride(0), cache_scale_k.stride(1), cache_scale_k.stride(2), # Scale and Min should share this stride since they are of same shape
+            cache_quant_v_upper.stride(0), cache_quant_v_upper.stride(1), cache_quant_v_upper.stride(2),
+            cache_scale_v.stride(0), cache_scale_v.stride(1), cache_scale_v.stride(2), # Scale and Min should share this stride since they are of same shape
+            mid_out.stride(0), mid_out.stride(1), mid_out.stride(2), mid_out.stride(3), mid_out.stride(4),
+            mid_out_logsumexp.stride(0), mid_out_logsumexp.stride(1), mid_out_logsumexp.stride(2), mid_out_logsumexp.stride(3),
+            kbit, vbit,
+            group_size,
+            elem_per_int,
+            gqa_group_size,
+            cur_qseq=q_idx,
+            BLOCK_SEQ=BLOCK_SEQ, # How many int2/int4 elements a block should load
+            BLOCK_SEQ_PER_INT=BLOCK_SEQ_PER_INT, # How many int32 elements a block should load
+            BLOCK_DMODEL=Lk,
+            BLOCK_DMODEL_PER_INT=Lk_PER_INT,
+            BLOCK_N=BLOCK_N, # How many int2/int4 elements a sub-block should load
+            BLOCK_N_PER_INT=BLOCK_N_PER_INT, # How many int32 elements a sub-block should load
+            precision=precision,
+            num_warps=8,
+            num_stages=4,
+        )
 
     return

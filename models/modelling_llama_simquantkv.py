@@ -287,16 +287,37 @@ def sim_cuda_bmm_fA_qB_outer(group_size, fA, quB, qlB, scale, mn, bits, mixed_bi
 
     B = Bu*scale.unsqueeze(-1) + mn.unsqueeze(-1)
     # TODO: implement mixed bits
-    if mixed_bits is not None: 
-        B = Bu*(2**bits) + Bl
-    else:
-        B = Bu*(2**bits)
+    B = Bu*(2**bits) + Bl
+    
     B = B*scale.unsqueeze(-1)/(2**bits)+ mn.unsqueeze(-1)
     B = B.reshape(*quB.shape[:-1], -1)
     out = torch.matmul(fA, B)
     out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
     return out
 
+# def sim_cuda_bmm_fA_qB_outer(group_size, fA, quB, qlB, scale, mn, bits, mixed_bits):
+#     # fA is of shape (B, nh, M, K) float16
+# 	# qB is of shape (B, nh, K, N) int32
+#     # scales is of shape (B, nh, K, G) float16
+# 	# zeros is of shape (B, nh, K, G) float16
+#     # bits: int
+#     # factors: (nh) float16
+    
+#     num_groups = quB.size(-1) // group_size
+#     num_heads = quB.size(1)
+#     Bu = quB.reshape(*quB.shape[:-1], num_groups, group_size)
+#     Bl = qlB.reshape(*qlB.shape[:-1], num_groups, group_size)
+
+#     # TODO: implement mixed bits
+#     if mixed_bits is not None: 
+#         B = Bu*(2**bits) + Bl
+#     else:
+#         B = (Bu+0.5).to(torch.float16)*(2**bits) 
+#     B = B*scale.unsqueeze(-1)+ mn.unsqueeze(-1)
+#     B = B.reshape(*quB.shape[:-1], -1)
+#     out = torch.matmul(fA, B)
+#     out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+#     return out
 
 
 
@@ -390,6 +411,7 @@ class LlamaFlashAttention2_SimQuant(LlamaAttention_SimQuant):
             trans_value_min = repeat_kv(past_key_value[9], self.num_key_value_groups)
 
 
+
             if key_scale is not None or trans_value_scale is not None:
 
                 if key_scale is not None:
@@ -429,6 +451,9 @@ class LlamaFlashAttention2_SimQuant(LlamaAttention_SimQuant):
                                                 trans_value_scale.transpose(2, 3), trans_value_min.transpose(2, 3), self.v_bits, self.v_mixed_bits)
                     attn_output += torch.matmul(attn_weights[:, :, :, -value_full_length:], value_states_full)
                 attn_output = attn_output.transpose(1, 2).contiguous()
+                # if query_states.shape[2]>1 and self.layer_idx==5:
+                #     import IPython
+                #     IPython.embed()
                 attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
                 attn_output = self.o_proj(attn_output)
 

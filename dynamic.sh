@@ -7,14 +7,19 @@ fi
 # --simquant \
 
 # target fp16, draft int8_with_upper_lower_bits
+# for prefill in 2048
+# do
+#     CUDA_VISIBLE_DEVICES=$1 TOKENIZERS_PARALLELISM=false python test/on_chip.py --verbose --draft meta-llama/Meta-Llama-3.1-8B --target meta-llama/Meta-Llama-3.1-8B --quantized_draft --k_bits 4 --v_bits 4 --group_size 128 --residual_length 128 --gen_len 256 --gamma 6 --top_p 0.0 --temp 0.0 \
+#     --prefill $prefill \
+#     --sensitivity_filepath /rscratch/rishabhtiwari/QuantSpec/results/llama_3.1_8b_simquant_k2v2_gs16_rl0_sensitivity.json \
+#     --percentile 0.05 \
+#     --identifier_string "llama 3.1 8b simqant dynamic gs 0"
+# done
+
 for prefill in 2048
 do
-    CUDA_VISIBLE_DEVICES=$1 TOKENIZERS_PARALLELISM=false python test/on_chip.py --verbose --draft meta-llama/Meta-Llama-3.1-8B --target meta-llama/Meta-Llama-3.1-8B --quantized_draft --k_bits 4 --v_bits 4 --group_size 128 --residual_length 128 --gen_len 256 --gamma 6 --top_p 0.0 --temp 0.0 \
+    CUDA_VISIBLE_DEVICES=$1 TOKENIZERS_PARALLELISM=false python test/spec.py --verbose --draft meta-llama/Meta-Llama-3.1-8B --target meta-llama/Meta-Llama-3.1-8B --k_bits 4 --v_bits 4 --group_size 128 --residual_length 128 --gen_len 256 --gamma 6 --top_p 0.0 --temp 0.0 \
     --prefill $prefill \
-    --simquant \
-    --mixed_precision \
-    --sensitivity_filepath /rscratch/rishabhtiwari/QuantSpec/results/llama_3.1_8b_simquant_k2v2_gs16_rl0_sensitivity.json \
-    --percentile 0.05 \
     --identifier_string "llama 3.1 8b simqant dynamic gs 0"
 done
 

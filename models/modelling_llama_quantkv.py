@@ -109,12 +109,14 @@ class LlamaAttention_Quant(LlamaAttention):
             self.k_proj = LinearAct(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=self.config.attention_bias) 
             self.v_proj = LinearAct(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=self.config.attention_bias)
 
-        if self.config.mixed_precision is not None:
-            self.k_mixed_bits = self.config.k_mixed_bits
-            self.v_mixed_bits = self.config.v_mixed_bits
+        if self.config.precision == 'higher':
+            self.mixed_bits = 8
+        elif self.config.precision == 'lower':
+            self.mixed_bits = 4
+        elif self.config.precision == 'mixed' and self.layer_idx >= self.config.first_few_fp16_layers:
+            self.mixed_bits = self.config.mixed_bits[self.layer_idx-self.config.first_few_fp16_layers]
         else:
-            self.k_mixed_bits = None
-            self.v_mixed_bits = None
+            self.mixed_bits = None
     
     def forward(
         self,
@@ -129,174 +131,7 @@ class LlamaAttention_Quant(LlamaAttention):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
-
-        if self.config.pretraining_tp > 1:
-            key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
-            query_slices = self.q_proj.weight.split(
-                (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
-            )
-            key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
-            value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
-
-            query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
-            query_states = torch.cat(query_states, dim=-1)
-
-            key_states = [F.linear(hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)]
-            key_states = torch.cat(key_states, dim=-1)
-
-            value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
-            value_states = torch.cat(value_states, dim=-1)
-
-        else:
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
-
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-        if position_embeddings is None:
-            logger.warning_once(
-                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
-                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
-                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.46 `position_ids` will be "
-                "removed and `position_embeddings` will be mandatory."
-            )
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        else:
-            cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-        elif kv_cache is not None:
-            ''' Our Logic Here '''
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            kv_seq_len = kv_cache.seq_len + q_len
-            past_key_value = kv_cache.update(key_states, value_states, layer_idx=self.layer_idx, cache_kwargs=cache_kwargs)
-    
-            key_states_full = repeat_kv(past_key_value[0], self.num_key_value_groups)
-            key_states_quant_ubits = repeat_kv(past_key_value[1], self.num_key_value_groups)
-            key_states_quant_lbits = repeat_kv(past_key_value[2], self.num_key_value_groups)
-            key_scale = repeat_kv(past_key_value[3], self.num_key_value_groups)
-            key_min = repeat_kv(past_key_value[4], self.num_key_value_groups)
-
-            value_states_full = repeat_kv(past_key_value[5], self.num_key_value_groups)
-            trans_value_states_quant_ubits = repeat_kv(past_key_value[6], self.num_key_value_groups)
-            trans_value_states_quant_lbits = repeat_kv(past_key_value[7], self.num_key_value_groups)
-            trans_value_scale = repeat_kv(past_key_value[8], self.num_key_value_groups)
-            trans_value_min = repeat_kv(past_key_value[9], self.num_key_value_groups)
-
- 
-            if key_scale is not None:
-                att_qkquant = sim_cuda_bmm_fA_qB_outer(self.group_size, query_states, key_states_quant_ubits.transpose(2, 3), key_states_quant_lbits.transpose(2, 3), 
-                                key_scale.transpose(2, 3), key_min.transpose(2, 3), self.k_bits, self.k_mixed_bits)
-            else:
-                att_qkquant = None
-            att_qkfull = torch.matmul(query_states, key_states_full.transpose(2, 3))
-            if att_qkquant is not None:
-                attn_weights = torch.cat([att_qkquant, att_qkfull], dim=-1) / math.sqrt(self.head_dim)
-            else:
-                attn_weights = att_qkfull / math.sqrt(self.head_dim)
-            
-            if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                    f" {attn_weights.size()}"
-                )
-        
-            
-            
-            if attention_mask is not None:  # no matter the length, we just slice it
-                causal_mask = attention_mask[:, :, :, : kv_seq_len]
-                attn_weights = attn_weights + causal_mask
-                attn_weights = torch.max(
-                    attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min)
-                )
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-
-            value_full_length = value_states_full.shape[-2]
-
-            if trans_value_scale is None:
-                attn_output = torch.matmul(attn_weights, value_states_full)
-            else:
-                attn_output = sim_cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, :-value_full_length], trans_value_states_quant_ubits.transpose(2, 3), trans_value_states_quant_lbits.transpose(2, 3), 
-                                                trans_value_scale.transpose(2, 3), trans_value_min.transpose(2, 3), self.v_bits, self.v_mixed_bits)
-                attn_output += torch.matmul(attn_weights[:, :, :, -value_full_length:], value_states_full)
-            attn_output = attn_output.transpose(1, 2).contiguous()
-            attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
-            attn_output = self.o_proj(attn_output)
-
-            if not output_attentions:
-                attn_weights = None
-
-            return attn_output, attn_weights, kv_cache
-
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if attention_mask is not None:  # no matter the length, we just slice it
-            
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
-
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-
-        attn_output = attn_output.reshape(bsz, q_len, -1)
-
-        if self.config.pretraining_tp > 1:
-            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
-            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
-            attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
-        else:
-            attn_output = self.o_proj(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
-
-def sim_cuda_bmm_fA_qB_outer(group_size, fA, quB, qlB, scale, mn, bits, mixed_bits):
-    # fA is of shape (B, nh, M, K) float16
-	# qB is of shape (B, nh, K, N) int32
-    # scales is of shape (B, nh, K, G) float16
-	# zeros is of shape (B, nh, K, G) float16
-    # bits: int
-    # factors: (nh) float16
-    
-    num_groups = quB.size(-1) // group_size
-    num_heads = quB.size(1)
-    Bu = quB.reshape(*quB.shape[:-1], num_groups, group_size)
-    Bl = qlB.reshape(*qlB.shape[:-1], num_groups, group_size)
-
-    B = Bu*scale.unsqueeze(-1) + mn.unsqueeze(-1)
-    # TODO: implement mixed bits
-    if mixed_bits is not None: 
-        B = Bu*(2**bits) + Bl
-    else:
-        B = Bu*(2**bits)
-    B = B*scale.unsqueeze(-1)/(2**bits)+ mn.unsqueeze(-1)
-    B = B.reshape(*quB.shape[:-1], -1)
-    out = torch.matmul(fA, B)
-    out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-    return out
+        raise ValueError("Not implemented, use the flash attention version")
 
 
 
@@ -393,49 +228,16 @@ class LlamaFlashAttention2_Quant(LlamaAttention_Quant):
 
             if key_scale is not None or trans_value_scale is not None:
 
-                # if key_scale is not None:
-                #     att_qkquant = sim_cuda_bmm_fA_qB_outer(self.group_size, query_states, key_states_quant_ubits.transpose(2, 3), key_states_quant_lbits.transpose(2, 3), 
-                #                 key_scale.transpose(2, 3), key_min.transpose(2, 3), self.k_bits, self.k_mixed_bits)
-                # else:
-                #     att_qkquant = None
-
-                # att_qkfull = torch.matmul(query_states, key_states_full.transpose(2, 3))
-                # if att_qkquant is not None:
-                #     attn_weights = torch.cat([att_qkquant, att_qkfull], dim=-1) / math.sqrt(self.head_dim)
-                # else:
-                #     attn_weights = att_qkfull / math.sqrt(self.head_dim)
-                
-                # if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-                #     raise ValueError(
-                #         f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                #         f" {attn_weights.size()}"
-                #     )
-                
-                # if attention_mask is not None:  # no matter the length, we just slice it
-                #     causal_mask = attention_mask[:, :, :, : kv_seq_len]
-                #     attn_weights = attn_weights + causal_mask
-                #     attn_weights = torch.max(
-                #         attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min)
-                #     )
-
-                
-                # attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-
-                # value_full_length = value_states_full.shape[-2]
-
-                # if trans_value_scale is None:
-                #     attn_output = torch.matmul(attn_weights, value_states_full)
-                # else:
-                #     attn_output = sim_cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, :-value_full_length], trans_value_states_quant_ubits.transpose(2, 3), trans_value_states_quant_lbits.transpose(2, 3), 
-                #                                 trans_value_scale.transpose(2, 3), trans_value_min.transpose(2, 3), self.v_bits, self.v_mixed_bits)
-                #     attn_output += torch.matmul(attn_weights[:, :, :, -value_full_length:], value_states_full)
-                # attn_output = attn_output.transpose(1, 2).contiguous()
                 attn_output = token_decode_attention_int8kv_upperlower_flash_decoding(
                     q=query_states, \
                     cache_quant_k_upper=key_states_quant_ubits, cache_quant_k_lower=key_states_quant_lbits, cache_scale_k=key_scale, cache_min_k=key_min, \
                     cache_quant_v_upper=trans_value_states_quant_ubits, cache_quant_v_lower=trans_value_states_quant_lbits, cache_scale_v=trans_value_scale, cache_min_v=trans_value_min, \
-                    kbit=self.k_bits, vbit=self.v_bits, group_size=self.group_size, full_k=key_states_full, full_v=value_states_full, out=None, alloc_tensor_func=torch.zeros
+                    kbit=self.k_bits, vbit=self.v_bits, group_size=self.group_size, full_k=key_states_full, full_v=value_states_full, out=None, alloc_tensor_func=torch.zeros, precision=self.mixed_bits
                 )
+                # if query_states.shape[2]>1 and self.layer_idx==5:
+                #     import IPython
+                #     IPython.embed()
+                attn_output = attn_output.transpose(1, 2)
                 attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
                 attn_output = self.o_proj(attn_output)
 
