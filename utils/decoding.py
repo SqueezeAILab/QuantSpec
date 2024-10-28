@@ -39,7 +39,7 @@ def SimQuantSpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, to
         speculation_probs = []
         for i in range(gamma):
             # print(i)
-            spec_engine.engine.draft_cache.seq_len -= i
+            spec_engine.engine.draft_cache.update_seq_lens(-i)
             logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,:i+1])
             # spec_engine.engine.draft_cache.print_status()
             # logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,i:i+1])
@@ -79,11 +79,12 @@ def SimQuantSpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, to
                     spec_stream(pred_token_idx, tokenizer, 'red')
                 break
 
-            # if tokenizer.eos_token_id == pred_token_idx:
-            #     break
+            if tokenizer.eos_token_id == pred_token_idx:
+                print("EOS"*20, flush=True)
+                break
         
-        spec_engine.engine.target_cache.seq_len -= (gamma - count)
-        spec_engine.engine.draft_cache.seq_len -= max(0,(gamma - count - 1))
+        spec_engine.engine.target_cache.update_seq_lens(-(gamma - count))
+        spec_engine.engine.draft_cache.update_seq_lens(-max(0,(gamma - count - 1)))
 
         if count == gamma:
             n += 1
@@ -102,7 +103,7 @@ def SimQuantSpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, to
     acceptance_rate = accepted_count / draft_count
     avg_tokens = accepted_count / draft_count * gamma
     if verbose:
-        print(f"Use {time2 - time1} sec to generate {n} tokens (now {spec_engine.engine.target_cache.seq_len} tokens), Tokens/s: {n / (time2 - time1)}", flush=True)
+        print(f"Use {time2 - time1} sec to generate {n} tokens (now {spec_engine.engine.target_cache.seq_lens[-1]} tokens), Tokens/s: {n / (time2 - time1)}", flush=True)
         print(f"accepted rate {acceptance_rate}, avg generated tokens {avg_tokens}")
 
     return acceptance_rate, n / (time2 - time1)
@@ -197,7 +198,7 @@ def QuantSpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, top_k
                 spec_stream(pred_token_idx, tokenizer, 'blue')
             count += 1
 
-        spec_engine.engine.target_cache.quantize_and_pack()
+        spec_engine.engine.draft_cache.quantize_and_pack()
 
         next_token = pred_token_idx
     time2 = time.time()

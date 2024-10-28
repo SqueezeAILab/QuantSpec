@@ -12,8 +12,8 @@ from tqdm import tqdm
 from data.dataset import get_dataset
 from models.modelling_llama_simquantkv import LlamaForCausalLM_SimQuant
 from models.modelling_llama_quantkv import LlamaForCausalLM_Quant
-from models.cache import QCache
-from utils.decoding import QuantSpecDecode
+from models.cache import QCache, SimQCacheV2
+from utils.decoding import QuantSpecDecode, SimQuantSpecDecode
 from utils.misc import print_config, log_csv, seed_everything
 from utils.graph_infer import GraphInferenceEngine
 from transformers import AutoTokenizer, LlamaConfig
@@ -24,6 +24,7 @@ import argparse
 def parse_arguments():
     parser = argparse.ArgumentParser(description='args for main.py')
     parser.add_argument('--cache_dir', type=str, default='/rscratch/rishabhtiwari/cache/')
+    parser.add_argument('--simquant', action='store_true', help='whether to use simulated quantization')
     parser.add_argument('--first_few_fp16_layers', type=int, default=0, help='first few fp16 layers')
     parser.add_argument('--k_bits', type=int, default=4, help='k_bits')
     parser.add_argument('--v_bits', type=int, default=4, help='v_bits')
@@ -34,7 +35,6 @@ def parse_arguments():
     parser.add_argument('--target', type=str, default='meta-llama/Meta-Llama-3.1-8B', help='target model')
     parser.add_argument('--draft', type=str, default='meta-llama/Meta-Llama-3.1-8B', help='draft model')
     parser.add_argument('--verbose', action='store_true', help='verbose')
-    parser.add_argument('--device_num', type=int, default=1, help='number of gpus to be used')
 
     parser.add_argument('--prefill', type=int, default=32768, help='prefill length')
     parser.add_argument('--gen_len', type=int, default=256, help='generation length')
@@ -102,19 +102,24 @@ if __name__ == "__main__":
     CACHE_DIR = args.cache_dir
 
     # Pipeline Parallelism
-    device_num = args.device_num
+    # device_num = args.device_num
+    device_num = torch.cuda.device_count()
     layer_num = config.num_hidden_layers
     layers_per_device = layer_num // device_num
     num_gpus = torch.cuda.device_count()
-    assert num_gpus == device_num, f"Number of GPUs ({num_gpus}) does not match the specified device number ({device_num})"
+    # assert num_gpus == device_num, f"Number of GPUs ({num_gpus}) does not match the specified device number ({device_num})"
 
     layer_device_map = []
     for layer_idx in range(layer_num):
         device = f"cuda:{layer_idx // layers_per_device}"
         layer_device_map.append(device)
     
-    draft_class = LlamaForCausalLM_Quant
-    target_class = LlamaForCausalLM_Quant
+    if args.simquant:
+        draft_class = LlamaForCausalLM_SimQuant
+        target_class = LlamaForCausalLM_SimQuant
+    else:
+        draft_class = LlamaForCausalLM_Quant
+        target_class = LlamaForCausalLM_Quant
 
     draft = draft_class.from_pretrained(
     pretrained_model_name_or_path=args.draft,
@@ -165,8 +170,10 @@ if __name__ == "__main__":
 
     
     
-    target_cache = QCache(target, max_budget=prefill+gen_len+16, layer_device_map=layer_device_map)
-    
+    if args.simquant:
+        target_cache = SimQCacheV2(target, max_budget=prefill+gen_len+16, layer_device_map=layer_device_map)
+    else:
+        target_cache = QCache(target, max_budget=prefill+gen_len+16, layer_device_map=layer_device_map)
     
     spec_engine = GraphInferenceEngine(target, target_cache, draft, target_cache)
 
