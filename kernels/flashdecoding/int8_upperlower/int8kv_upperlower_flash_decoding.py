@@ -66,10 +66,10 @@ def token_decode_attention_int8kv_upperlower_flash_decoding(
     o_tensor = alloc_tensor_func(q.shape, dtype=q.dtype, device=q.device) if out is None else out
 
     mid_o = alloc_tensor_func(
-        [batch_size, q_head_num, query_sequence_length, max_len_in_batch // BLOCK_SEQ + 1, head_dim], dtype=torch.float32, device="cuda"
+        [batch_size, q_head_num, query_sequence_length, max_len_in_batch // BLOCK_SEQ + 1, head_dim], dtype=torch.float32, device=q.device
     )
     mid_o_logexpsum = alloc_tensor_func(
-        [batch_size, q_head_num, query_sequence_length, max_len_in_batch // BLOCK_SEQ + 1], dtype=torch.float32, device="cuda"
+        [batch_size, q_head_num, query_sequence_length, max_len_in_batch // BLOCK_SEQ + 1], dtype=torch.float32, device=q.device
     )
 
     q_kernel = q.view(calcu_shape1)

@@ -34,6 +34,7 @@ def parse_arguments():
     parser.add_argument('--target', type=str, default='meta-llama/Meta-Llama-3.1-8B', help='target model')
     parser.add_argument('--draft', type=str, default='meta-llama/Meta-Llama-3.1-8B', help='draft model')
     parser.add_argument('--verbose', action='store_true', help='verbose')
+    parser.add_argument('--device_num', type=int, default=1, help='number of gpus to be used')
 
     parser.add_argument('--prefill', type=int, default=32768, help='prefill length')
     parser.add_argument('--gen_len', type=int, default=256, help='generation length')
@@ -100,6 +101,17 @@ if __name__ == "__main__":
 
     CACHE_DIR = args.cache_dir
 
+    # Pipeline Parallelism
+    device_num = args.device_num
+    layer_num = config.num_hidden_layers
+    layers_per_device = layer_num // device_num
+    num_gpus = torch.cuda.device_count()
+    assert num_gpus == device_num, f"Number of GPUs ({num_gpus}) does not match the specified device number ({device_num})"
+
+    layer_device_map = []
+    for layer_idx in range(layer_num):
+        device = f"cuda:{layer_idx // layers_per_device}"
+        layer_device_map.append(device)
     
     draft_class = LlamaForCausalLM_Quant
     target_class = LlamaForCausalLM_Quant
@@ -109,7 +121,7 @@ if __name__ == "__main__":
     config=config,
     cache_dir=CACHE_DIR,
     torch_dtype=torch.float16,
-    device_map="cuda:0"
+    device_map=layer_device_map[0]
     )
     
     target = target_class.from_pretrained(
@@ -117,8 +129,15 @@ if __name__ == "__main__":
     config=target_config,
     cache_dir=CACHE_DIR,
     torch_dtype=torch.float16,
-    device_map="cuda:0"
+    device_map=layer_device_map[0]
     )
+
+    draft.model.layer_device_map = layer_device_map
+    target.model.layer_device_map = layer_device_map
+
+    for layer_idx in range(layer_num):
+        draft.model.layers[layer_idx].to(layer_device_map[layer_idx])
+        target.model.layers[layer_idx].to(layer_device_map[layer_idx])
     
     draft = draft.eval()
     target = target.eval()
@@ -146,7 +165,7 @@ if __name__ == "__main__":
 
     
     
-    target_cache = QCache(target, max_budget=prefill+gen_len+16)
+    target_cache = QCache(target, max_budget=prefill+gen_len+16, layer_device_map=layer_device_map)
     
     
     spec_engine = GraphInferenceEngine(target, target_cache, draft, target_cache)

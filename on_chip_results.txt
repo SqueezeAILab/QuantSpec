@@ -384,3 +384,20 @@ llama 3.1 8b simqant dynamic gs 0, gs, 2048, 4, 4, 128
 llama 3.1 8b simqant dynamic gs 0, gs, 2048, 4, 4, 128
 0.9251044678321747, [1.0, 0.8294573643410853, 0.9487179487179487, 0.8780487804878049, 0.9692982456140351], 91.01634980263613
 llama 3.1 8b simqant dynamic gs 0, gs, 16000, 4, 4, 128
+llama 3.1 8b simqant dynamic gs 0, gs, 16000, 4, 4, 128
+0.9243302222025627, [1.0, 0.7588652482269503, 0.990990990990991, 0.9316239316239316, 0.9401709401709402], 96.07131263126092
+llama 3.1 8b simqant dynamic gs 0, gs, 8192, 4, 4, 128
+llama 3.1 8b simqant dynamic gs 0, gs, 8192, 4, 4, 128
+llama 3.1 8b simqant dynamic gs 0, gs, 8192, 4, 4, 128
+llama 3.1 8b simqant dynamic gs 0, gs, 8192, 4, 4, 128
+llama 3.1 8b simqant dynamic gs 0, gs, 8192, 4, 4, 128
+llama 3.1 8b simqant dynamic gs 0, gs, 8192, 4, 4, 128
+llama 3.1 8b simqant dynamic gs 0, gs, 8192, 4, 4, 128
+0.9385258016836964, [0.9649122807017544, 0.873015873015873, 0.9529914529914529, 0.9529914529914529, 0.9487179487179487], 100.75214682408173
+llama 3.1 8b simqant dynamic gs 0, gs, 8192, 4, 4, 128
+llama 3.1 8b simqant dynamic gs 0, gs, 8192, 4, 4, 128
+llama 3.1 8b simqant dynamic gs 0, gs, 8192, 4, 4, 128
+llama 3.1 8b simqant dynamic gs 0, gs, 8192, 4, 4, 128
+llama 3.1 8b simqant dynamic gs 0, gs, 8192, 4, 4, 128
+llama 3.1 8b simqant dynamic gs 0, gs, 8192, 4, 4, 128
+llama 3.1 8b simqant dynamic gs 0, gs, 8192, 4, 4, 128

@@ -210,7 +210,7 @@ class LlamaFlashAttention2_Quant(LlamaAttention_Quant):
 
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
 
-            kv_seq_len = kv_cache.seq_len + q_len
+            # kv_seq_len = kv_cache.seq_len + q_len
             past_key_value = kv_cache.update(key_states, value_states, layer_idx=self.layer_idx, cache_kwargs=cache_kwargs)
 
             key_states_full = repeat_kv(past_key_value[0], self.num_key_value_groups)
@@ -234,6 +234,7 @@ class LlamaFlashAttention2_Quant(LlamaAttention_Quant):
                     cache_quant_v_upper=trans_value_states_quant_ubits, cache_quant_v_lower=trans_value_states_quant_lbits, cache_scale_v=trans_value_scale, cache_min_v=trans_value_min, \
                     kbit=self.k_bits, vbit=self.v_bits, group_size=self.group_size, full_k=key_states_full, full_v=value_states_full, out=None, alloc_tensor_func=torch.zeros, precision=self.mixed_bits
                 )
+                torch.cuda.synchronize(device='cuda:0')
                 # if query_states.shape[2]>1 and self.layer_idx==5:
                 #     import IPython
                 #     IPython.embed()
@@ -467,7 +468,7 @@ class LlamaModel_Quant(LlamaPreTrainedModel_Quant):
         if past_key_values is not None:
             past_seen_tokens = past_key_values.get_seq_length()
         elif kv_cache is not None:
-            past_seen_tokens = kv_cache.seq_len
+            past_seen_tokens = kv_cache.seq_lens[-1]
         else:
             past_seen_tokens = 0
         using_static_cache = isinstance(past_key_values, StaticCache)
@@ -573,7 +574,7 @@ class LlamaModel_Quant(LlamaPreTrainedModel_Quant):
             if past_key_values is not None:
                 past_seen_tokens = past_key_values.get_seq_length()
             elif kv_cache is not None:
-                past_seen_tokens = kv_cache.seq_len
+                past_seen_tokens = kv_cache.seq_lens[-1]
             else:
                 past_seen_tokens = 0
             cache_position = torch.arange(
@@ -595,9 +596,21 @@ class LlamaModel_Quant(LlamaPreTrainedModel_Quant):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+
+            new_device = decoder_layer.input_layernorm.weight.device
+            if hidden_states.device != new_device:
+                hidden_states = hidden_states.to(new_device)
+                causal_mask = causal_mask.to(new_device)
+                position_ids = position_ids.to(new_device)
+                cache_position = cache_position.to(new_device)
+
+                cos, sin = position_embeddings
+                cos = cos.to(new_device)
+                sin = sin.to(new_device)
+                position_embeddings = (cos, sin)
 
             if self.gradient_checkpointing and self.training:
                 assert False, "No training and checkpointing"
@@ -632,6 +645,9 @@ class LlamaModel_Quant(LlamaPreTrainedModel_Quant):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+    
+        if hidden_states.device != self.norm.weight.device:
+            hidden_states = hidden_states.to(self.norm.weight.device)
 
         hidden_states = self.norm(hidden_states)
 

@@ -267,7 +267,7 @@ class SimQCacheV2(Cache, torch.nn.Module):
 
         return q_ubits.reshape(*inp.shape[:-3], -1, inp.shape[-1]), q_lbits.reshape(*inp.shape[:-3], -1, inp.shape[-1]), scale, minval
 class QCache(Cache, torch.nn.Module):
-    def __init__(self, model, max_budget=1024) -> None:
+    def __init__(self, model, max_budget=1024, layer_device_map=None) -> None:
         super().__init__()
         self.batch_size = 1 # TODO: change this to support batch size > 1
         self.max_budget = max_budget
@@ -281,23 +281,28 @@ class QCache(Cache, torch.nn.Module):
         self.num_key_value_heads = model.config.num_key_value_heads
         self.head_dim = self.hidden_size // model.config.num_attention_heads
         self.layers = model.config.num_hidden_layers
-        self.device = model.device # TODO: change this to support multi-gpu
+        self.device = model.device 
+        self.devices = layer_device_map # TODO: change this to support multi-gpu
 
         # Full cache (residual) and quantized cache
         self.full_key_cache_fp16: List[torch.Tensor] = []
         self.full_value_cache_fp16: List[torch.Tensor] = []
-        self.full_key_cache: List[torch.Tensor] = []
-        self.full_value_cache: List[torch.Tensor] = []
-        self.quantize_key_cache_ubits: List[torch.Tensor] = []
-        self.quantize_key_cache_lbits: List[torch.Tensor] = []
-        self.trans_quantize_value_cache_ubits: List[torch.Tensor] = []
-        self.trans_quantize_value_cache_lbits: List[torch.Tensor] = []
+        self.full_key_cache: List[torch.Tensor] = [None]*self.first_few_fp16_layers
+        self.full_value_cache: List[torch.Tensor] = [None]*self.first_few_fp16_layers
+        self.quantize_key_cache_ubits: List[torch.Tensor] = [None]*self.first_few_fp16_layers
+        self.quantize_key_cache_lbits: List[torch.Tensor] = [None]*self.first_few_fp16_layers
+        self.trans_quantize_value_cache_ubits: List[torch.Tensor] = [None]*self.first_few_fp16_layers
+        self.trans_quantize_value_cache_lbits: List[torch.Tensor] = [None]*self.first_few_fp16_layers
 
         # Zeropoint and Scale
-        self.min_key_cache: List[torch.Tensor] = []
-        self.trans_min_value_cache: List[torch.Tensor] = []
-        self.scale_key_cache: List[torch.Tensor] = []
-        self.trans_scale_value_cache: List[torch.Tensor] = []
+        self.min_key_cache: List[torch.Tensor] = [None]*self.first_few_fp16_layers
+        self.trans_min_value_cache: List[torch.Tensor] = [None]*self.first_few_fp16_layers
+        self.scale_key_cache: List[torch.Tensor] = [None]*self.first_few_fp16_layers
+        self.trans_scale_value_cache: List[torch.Tensor] = [None]*self.first_few_fp16_layers
+
+        self.seq_lens: List[torch.Tensor] = []
+        self.quant_key_lens: List[torch.Tensor] = [None]*self.first_few_fp16_layers
+        self.quant_val_lens: List[torch.Tensor] = [None]*self.first_few_fp16_layers
 
         self.dtype = model.model.layers[0].self_attn.q_proj.weight.dtype
         self.qtype = torch.int8
@@ -318,24 +323,33 @@ class QCache(Cache, torch.nn.Module):
 
         for idx in range(self.layers):
             if idx < self.first_few_fp16_layers:
-                self.register_buffer(f"full_key_cache_{idx}", torch.zeros(fp16_full_key_cache_shape, dtype=torch.float16, device=self.device))
-                self.register_buffer(f"full_value_cache_{idx}", torch.zeros(fp16_full_value_cache_shape, dtype=torch.float16, device=self.device))
+                self.register_buffer(f"seq_len_{idx}", torch.tensor(0, dtype=torch.long, device=self.devices[idx]))
+                self.register_buffer(f"full_key_cache_{idx}", torch.zeros(fp16_full_key_cache_shape, dtype=torch.float16, device=self.devices[idx]))
+                self.register_buffer(f"full_value_cache_{idx}", torch.zeros(fp16_full_value_cache_shape, dtype=torch.float16, device=self.devices[idx]))
+                new_seq_len = getattr(self, f"seq_len_{idx}")
                 new_full_layer_key_cache = getattr(self, f"full_key_cache_{idx}")
                 new_full_layer_value_cache = getattr(self, f"full_value_cache_{idx}")
                 self.full_key_cache_fp16.append(new_full_layer_key_cache)
                 self.full_value_cache_fp16.append(new_full_layer_value_cache)
+                self.seq_lens.append(new_seq_len)
             else:
-                self.register_buffer(f"full_key_cache_{idx}", torch.zeros(full_key_cache_shape, dtype=self.dtype, device=self.device))
-                self.register_buffer(f"full_value_cache_{idx}", torch.zeros(full_value_cache_shape, dtype=self.dtype, device=self.device))
-                self.register_buffer(f"quantize_key_cache_ubits{idx}", torch.zeros(quantize_key_cache_shape, dtype=self.qtype, device=self.device))
-                self.register_buffer(f"quantize_key_cache_lbits{idx}", torch.zeros(quantize_key_cache_shape, dtype=self.qtype, device=self.device))
-                self.register_buffer(f"trans_quantize_value_cache_ubits{idx}", torch.zeros(trans_quantize_value_cache_shape, dtype=self.qtype, device=self.device))
-                self.register_buffer(f"trans_quantize_value_cache_lbits{idx}", torch.zeros(trans_quantize_value_cache_shape, dtype=self.qtype, device=self.device))
+                self.register_buffer(f"seq_len_{idx}", torch.tensor(0, dtype=torch.long, device=self.devices[idx]))
+                self.register_buffer(f"quant_key_len_{idx}", torch.tensor(0, dtype=torch.long, device=self.devices[idx]))
+                self.register_buffer(f"quant_val_len_{idx}", torch.tensor(0, dtype=torch.long, device=self.devices[idx]))
+                self.register_buffer(f"full_key_cache_{idx}", torch.zeros(full_key_cache_shape, dtype=self.dtype, device=self.devices[idx]))
+                self.register_buffer(f"full_value_cache_{idx}", torch.zeros(full_value_cache_shape, dtype=self.dtype, device=self.devices[idx]))
+                self.register_buffer(f"quantize_key_cache_ubits{idx}", torch.zeros(quantize_key_cache_shape, dtype=self.qtype, device=self.devices[idx]))
+                self.register_buffer(f"quantize_key_cache_lbits{idx}", torch.zeros(quantize_key_cache_shape, dtype=self.qtype, device=self.devices[idx]))
+                self.register_buffer(f"trans_quantize_value_cache_ubits{idx}", torch.zeros(trans_quantize_value_cache_shape, dtype=self.qtype, device=self.devices[idx]))
+                self.register_buffer(f"trans_quantize_value_cache_lbits{idx}", torch.zeros(trans_quantize_value_cache_shape, dtype=self.qtype, device=self.devices[idx]))
 
-                self.register_buffer(f"min_key_cache_{idx}", torch.zeros(min_key_cache_shape, dtype=self.dtype, device=self.device))
-                self.register_buffer(f"trans_min_value_cache_{idx}", torch.zeros(trans_min_value_cache_shape, dtype=self.dtype, device=self.device))
-                self.register_buffer(f"scale_key_cache_{idx}", torch.zeros(scale_key_cache_shape, dtype=self.dtype, device=self.device))
-                self.register_buffer(f"trans_scale_value_cache_{idx}", torch.zeros(trans_scale_value_cache_shape, dtype=self.dtype, device=self.device))
+                self.register_buffer(f"min_key_cache_{idx}", torch.zeros(min_key_cache_shape, dtype=self.dtype, device=self.devices[idx]))
+                self.register_buffer(f"trans_min_value_cache_{idx}", torch.zeros(trans_min_value_cache_shape, dtype=self.dtype, device=self.devices[idx]))
+                self.register_buffer(f"scale_key_cache_{idx}", torch.zeros(scale_key_cache_shape, dtype=self.dtype, device=self.devices[idx]))
+                self.register_buffer(f"trans_scale_value_cache_{idx}", torch.zeros(trans_scale_value_cache_shape, dtype=self.dtype, device=self.devices[idx]))
+                new_seq_len = getattr(self, f"seq_len_{idx}")
+                new_quant_key_len = getattr(self, f"quant_key_len_{idx}")
+                new_quant_val_len = getattr(self, f"quant_val_len_{idx}")
                 new_full_layer_key_cache = getattr(self, f"full_key_cache_{idx}")
                 new_full_layer_value_cache = getattr(self, f"full_value_cache_{idx}")
                 new_quantize_layer_key_cache_ubits = getattr(self, f"quantize_key_cache_ubits{idx}")
@@ -347,6 +361,9 @@ class QCache(Cache, torch.nn.Module):
                 new_scale_layer_key_cache = getattr(self, f"scale_key_cache_{idx}")
                 new_trans_scale_layer_value_cache = getattr(self, f"trans_scale_value_cache_{idx}")
 
+                torch._dynamo.mark_static_address(new_seq_len)
+                torch._dynamo.mark_static_address(new_quant_key_len)
+                torch._dynamo.mark_static_address(new_quant_val_len)
                 torch._dynamo.mark_static_address(new_full_layer_key_cache)
                 torch._dynamo.mark_static_address(new_full_layer_value_cache)
                 torch._dynamo.mark_static_address(new_quantize_layer_key_cache_ubits)
@@ -371,56 +388,68 @@ class QCache(Cache, torch.nn.Module):
                 self.scale_key_cache.append(new_scale_layer_key_cache)
                 self.trans_scale_value_cache.append(new_trans_scale_layer_value_cache)
 
-        self.register_buffer("seq_len", torch.tensor(0, dtype=torch.long, device=self.device))
-        self.register_buffer("quant_key_len", torch.tensor(0, dtype=torch.long, device=self.device))
-        self.register_buffer("quant_val_len", torch.tensor(0, dtype=torch.long, device=self.device))
+                self.quant_key_lens.append(new_quant_key_len)
+                self.quant_val_lens.append(new_quant_val_len)
+                self.seq_lens.append(new_seq_len)
+
+        # self.register_buffer("seq_len", torch.tensor(0, dtype=torch.long, device=self.device))
+        # self.register_buffer("quant_key_len", torch.tensor(0, dtype=torch.long, device=self.device))
+        # self.register_buffer("quant_val_len", torch.tensor(0, dtype=torch.long, device=self.device))
 
         self.reset()
 
     def reset(self):
-        self.seq_len.zero_()
-        self.quant_key_len.zero_()
-        self.quant_val_len.zero_()
+        # self.seq_len.zero_()
+        # self.quant_key_len.zero_()
+        # self.quant_val_len.zero_()
 
-        for idx in range(self.first_few_fp16_layers):
-            self.full_key_cache_fp16[idx].zero_()
-            self.full_value_cache_fp16[idx].zero_()
+        for idx in range(self.layers):
+            if idx < self.first_few_fp16_layers:
+                self.seq_lens[idx].zero_()
+                self.full_key_cache_fp16[idx].zero_()
+                self.full_value_cache_fp16[idx].zero_()
+            else:
+                self.seq_lens[idx].zero_()
+                self.quant_key_lens[idx].zero_()
+                self.quant_val_lens[idx].zero_()
+                self.full_key_cache[idx].zero_()
+                self.full_value_cache[idx].zero_()
+                self.quantize_key_cache_ubits[idx].zero_()
+                self.quantize_key_cache_lbits[idx].zero_()
+                self.trans_quantize_value_cache_ubits[idx].zero_()
+                self.trans_quantize_value_cache_lbits[idx].zero_()
 
-        for idx in range(self.layers-self.first_few_fp16_layers):
-            self.full_key_cache[idx].zero_()
-            self.full_value_cache[idx].zero_()
-            self.quantize_key_cache_ubits[idx].zero_()
-            self.quantize_key_cache_lbits[idx].zero_()
-            self.trans_quantize_value_cache_ubits[idx].zero_()
-            self.trans_quantize_value_cache_lbits[idx].zero_()
-
-            self.min_key_cache[idx].zero_()
-            self.trans_min_value_cache[idx].zero_()
-            self.scale_key_cache[idx].zero_()
-            self.trans_scale_value_cache[idx].zero_()
+                self.min_key_cache[idx].zero_()
+                self.trans_min_value_cache[idx].zero_()
+                self.scale_key_cache[idx].zero_()
+                self.trans_scale_value_cache[idx].zero_()
+            
+        
+    def update_seq_lens(self, delta):
+        for layer_idx in range(len(self.seq_lens)):
+            self.seq_lens[layer_idx] += delta
     
     def print_status(self):
-        print("[Full Cache] Cached:", self.seq_len.item(), "| Quantized:", self.quant_key_len.item(), self.quant_val_len.item(), "| full_precision:", self.seq_len.item()-self.quant_key_len.item(), self.seq_len.item()-self.quant_val_len.item())
+        print("[Full Cache] Cached:", self.seq_lens[-1], "| Quantized:", self.quant_key_lens[-1], self.quant_val_lens[-1], "| full_precision:", self.seq_lens[-1]-self.quant_key_lens[-1], self.seq_lens[-1]-self.quant_val_lens[-1])
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs):
         # 1, nh, seq_len, head_dim
         if layer_idx < self.first_few_fp16_layers:
-            self.full_key_cache_fp16[layer_idx][:, :, self.seq_len:self.seq_len+key_states.shape[-2]].copy_(key_states)
-            self.full_value_cache_fp16[layer_idx][:, :, self.seq_len:self.seq_len+value_states.shape[-2]].copy_(value_states)
+            self.full_key_cache_fp16[layer_idx][:, :, self.seq_lens[layer_idx]:self.seq_lens[layer_idx]+key_states.shape[-2]].copy_(key_states)
+            self.full_value_cache_fp16[layer_idx][:, :, self.seq_lens[layer_idx]:self.seq_lens[layer_idx]+value_states.shape[-2]].copy_(value_states)
             output = (
-                self.full_key_cache_fp16[layer_idx][:, :, :self.seq_len+key_states.shape[-2]],
+                self.full_key_cache_fp16[layer_idx][:, :, :self.seq_lens[layer_idx]+key_states.shape[-2]],
                 None, None, None, None,
             )
             output += (
-                self.full_value_cache_fp16[layer_idx][:, :, :self.seq_len+value_states.shape[-2]],
+                self.full_value_cache_fp16[layer_idx][:, :, :self.seq_lens[layer_idx]+value_states.shape[-2]],
                 None, None, None, None,
             )
-            if layer_idx == self.layers-1:
-                self.seq_len += key_states.shape[-2]
+            self.seq_lens[layer_idx] += key_states.shape[-2]
             return output
 
-        elif self.seq_len.item() == 0: # prefill
-            layer_idx -= self.first_few_fp16_layers
+        elif self.seq_lens[layer_idx].item() == 0: # prefill
+            # layer_idx -= self.first_few_fp16_layers
             output = (key_states, None, None, None, None)
             output += (value_states, None, None, None, None)
 
@@ -434,7 +463,7 @@ class QCache(Cache, torch.nn.Module):
                     self.full_key_cache[layer_idx][:, :, :prefill_len-to_quant_len].copy_(key_states[:, :, to_quant_len:].clone())
                     self.full_value_cache[layer_idx][:, :, :prefill_len-to_quant_len].copy_(value_states[:, :, to_quant_len:].clone())
 
-                key_states_quant_ubits, key_states_quant_lbits, key_scale, key_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(key_states[:, :, :to_quant_len].clone(), self.group_size, self.k_bits)
+                key_states_quant_ubits, key_states_quant_lbits, key_scale, key_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(key_states[:, :, :to_quant_len].clone().contiguous(), self.group_size, self.k_bits)
                 value_states_quant_ubits, value_states_quant_lbits, value_scale, value_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(value_states[:, :, :to_quant_len].clone().transpose(2,3).contiguous(), self.group_size, self.v_bits)
                 self.quantize_key_cache_ubits[layer_idx][:, :, :to_quant_len].copy_(key_states_quant_ubits)
                 self.quantize_key_cache_lbits[layer_idx][:, :, :to_quant_len].copy_(key_states_quant_lbits)
@@ -446,63 +475,68 @@ class QCache(Cache, torch.nn.Module):
                 self.trans_scale_value_cache[layer_idx][:, :, :, :to_quant_len].copy_(value_scale)
                 self.trans_min_value_cache[layer_idx][:, :, :, :to_quant_len].copy_(value_min)
 
-                if layer_idx == self.layers-self.first_few_fp16_layers-1:
-                    self.quant_key_len += to_quant_len
-                    self.quant_val_len += to_quant_len
-                    self.seq_len += prefill_len
+                # if layer_idx == self.layers-self.first_few_fp16_layers-1:
+                self.quant_key_lens[layer_idx] += to_quant_len
+                self.quant_val_lens[layer_idx] += to_quant_len
+                self.seq_lens[layer_idx] += prefill_len
             return output
         else: # decode
-            layer_idx -= self.first_few_fp16_layers
-            self.full_key_cache[layer_idx][:, :, self.seq_len-self.quant_key_len:self.seq_len-self.quant_key_len+key_states.shape[-2]].copy_(key_states)
-            self.full_value_cache[layer_idx][:, :, self.seq_len-self.quant_val_len:self.seq_len-self.quant_val_len+value_states.shape[-2]].copy_(value_states)
+            # layer_idx -= self.first_few_fp16_layers
+            self.full_key_cache[layer_idx][:, :, self.seq_lens[layer_idx]-self.quant_key_lens[layer_idx]:self.seq_lens[layer_idx]-self.quant_key_lens[layer_idx]+key_states.shape[-2]].copy_(key_states)
+            self.full_value_cache[layer_idx][:, :, self.seq_lens[layer_idx]-self.quant_val_lens[layer_idx]:self.seq_lens[layer_idx]-self.quant_val_lens[layer_idx]+value_states.shape[-2]].copy_(value_states)
             output = (
-                self.full_key_cache[layer_idx][:, :, :self.seq_len-self.quant_key_len+key_states.shape[-2]],
-                self.quantize_key_cache_ubits[layer_idx][:, :, :self.quant_key_len],
-                self.quantize_key_cache_lbits[layer_idx][:, :, :self.quant_key_len],
-                self.scale_key_cache[layer_idx][:, :, :self.quant_key_len//self.group_size],
-                self.min_key_cache[layer_idx][:, :, :self.quant_key_len//self.group_size],
+                self.full_key_cache[layer_idx][:, :, :self.seq_lens[layer_idx]-self.quant_key_lens[layer_idx]+key_states.shape[-2]],
+                self.quantize_key_cache_ubits[layer_idx][:, :, :self.quant_key_lens[layer_idx]],
+                self.quantize_key_cache_lbits[layer_idx][:, :, :self.quant_key_lens[layer_idx]],
+                self.scale_key_cache[layer_idx][:, :, :self.quant_key_lens[layer_idx]//self.group_size],
+                self.min_key_cache[layer_idx][:, :, :self.quant_key_lens[layer_idx]//self.group_size],
             )
             output += (
-                self.full_value_cache[layer_idx][:, :, :self.seq_len-self.quant_val_len+value_states.shape[-2]],
-                self.trans_quantize_value_cache_ubits[layer_idx][:, :, :, :self.quant_val_len//(8//self.v_bits)],
-                self.trans_quantize_value_cache_lbits[layer_idx][:, :, :, :self.quant_val_len//(8//self.v_bits)],
-                self.trans_scale_value_cache[layer_idx][:, :, :, :self.quant_val_len],
-                self.trans_min_value_cache[layer_idx][:, :, :, :self.quant_val_len],
+                self.full_value_cache[layer_idx][:, :, :self.seq_lens[layer_idx]-self.quant_val_lens[layer_idx]+value_states.shape[-2]],
+                self.trans_quantize_value_cache_ubits[layer_idx][:, :, :, :self.quant_val_lens[layer_idx]//(8//self.v_bits)],
+                self.trans_quantize_value_cache_lbits[layer_idx][:, :, :, :self.quant_val_lens[layer_idx]//(8//self.v_bits)],
+                self.trans_scale_value_cache[layer_idx][:, :, :, :self.quant_val_lens[layer_idx]],
+                self.trans_min_value_cache[layer_idx][:, :, :, :self.quant_val_lens[layer_idx]],
             )
-            if layer_idx == self.layers-self.first_few_fp16_layers-1:
-                self.seq_len += key_states.shape[-2]
+            # if layer_idx == self.layers-self.first_few_fp16_layers-1:
+            self.seq_lens[layer_idx] += key_states.shape[-2]
             return output
 
     def quantize_and_pack(self):
-        full_key_len = self.seq_len - self.quant_key_len
+        full_key_len = self.seq_lens[-1] - self.quant_key_lens[-1]
         if full_key_len > 2*self.residual_length:
             assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
-            to_quant_len = full_key_len-self.residual_length-(full_key_len%self.residual_length)
-            for layer_idx in range(self.layers-self.first_few_fp16_layers):
+            for layer_idx in range(self.first_few_fp16_layers, self.layers):
+                full_key_len = self.seq_lens[layer_idx] - self.quant_key_lens[layer_idx]
+                to_quant_len = full_key_len-self.residual_length-(full_key_len%self.residual_length)
+ 
                 to_quant_key_states = self.full_key_cache[layer_idx][:, :, :to_quant_len]
-                key_states_quant_ubits, key_states_quant_lbits, key_scale, key_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(to_quant_key_states.clone(), self.group_size, self.k_bits)
+                key_states_quant_ubits, key_states_quant_lbits, key_scale, key_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(to_quant_key_states.clone().contiguous(), self.group_size, self.k_bits)
                 self.full_key_cache[layer_idx][:, :, :full_key_len-to_quant_len].copy_(self.full_key_cache[layer_idx][:, :, to_quant_len:full_key_len].clone())
 
-                self.quantize_key_cache_ubits[layer_idx][:, :, self.quant_key_len:(self.quant_key_len+to_quant_len)].copy_(key_states_quant_ubits)
-                self.quantize_key_cache_lbits[layer_idx][:, :, self.quant_key_len:(self.quant_key_len+to_quant_len)].copy_(key_states_quant_lbits)
-                self.scale_key_cache[layer_idx][:, :, self.quant_key_len//self.group_size:(self.quant_key_len+to_quant_len)//self.group_size].copy_(key_scale)
-                self.min_key_cache[layer_idx][:, :, self.quant_key_len//self.group_size:(self.quant_key_len+to_quant_len)//self.group_size].copy_(key_min)
-            self.quant_key_len += to_quant_len
+                self.quantize_key_cache_ubits[layer_idx][:, :, self.quant_key_lens[layer_idx]:(self.quant_key_lens[layer_idx]+to_quant_len)].copy_(key_states_quant_ubits)
+                self.quantize_key_cache_lbits[layer_idx][:, :, self.quant_key_lens[layer_idx]:(self.quant_key_lens[layer_idx]+to_quant_len)].copy_(key_states_quant_lbits)
+                self.scale_key_cache[layer_idx][:, :, self.quant_key_lens[layer_idx]//self.group_size:(self.quant_key_lens[layer_idx]+to_quant_len)//self.group_size].copy_(key_scale)
+                self.min_key_cache[layer_idx][:, :, self.quant_key_lens[layer_idx]//self.group_size:(self.quant_key_lens[layer_idx]+to_quant_len)//self.group_size].copy_(key_min)
+                self.quant_key_lens[layer_idx] += to_quant_len
 
-        full_val_len = self.seq_len - self.quant_val_len
+        full_val_len = self.seq_lens[-1] - self.quant_val_lens[-1]
         if full_val_len > 2*self.residual_length:
             assert self.residual_length % self.group_size == 0, "Residual length must be divisible by group size"
             # to_quant_len = full_val_len-self.residual_length
-            to_quant_len = full_val_len-self.residual_length-(full_val_len%self.residual_length)
-            for layer_idx in range(self.layers-self.first_few_fp16_layers):
+            
+            for layer_idx in range(self.first_few_fp16_layers, self.layers):
+                full_val_len = self.seq_lens[layer_idx] - self.quant_val_lens[layer_idx]
+                to_quant_len = full_val_len-self.residual_length-(full_val_len%self.residual_length)
+
                 to_quant_value_states = self.full_value_cache[layer_idx][:, :, :to_quant_len]
                 value_states_quant_ubits, value_states_quant_lbits, value_scale, value_min = triton_int8toint8_upperlower_quantize_along_penultimate_dim_and_pack_along_last_dim(to_quant_value_states.clone().transpose(2,3).contiguous(), self.group_size, self.v_bits)
                 self.full_value_cache[layer_idx][:, :, :full_val_len-to_quant_len].copy_(self.full_value_cache[layer_idx][:, :, to_quant_len:full_val_len])
 
-                self.trans_quantize_value_cache_ubits[layer_idx][:, :, :, self.quant_val_len//(8//self.v_bits):(self.quant_val_len+to_quant_len)//(8//self.v_bits)].copy_(value_states_quant_ubits)
-                self.trans_quantize_value_cache_lbits[layer_idx][:, :, :, self.quant_val_len//(8//self.v_bits):(self.quant_val_len+to_quant_len)//(8//self.v_bits)].copy_(value_states_quant_lbits)
-                self.trans_scale_value_cache[layer_idx][:, :, :, self.quant_val_len:(self.quant_val_len+to_quant_len)].copy_(value_scale)
-                self.trans_min_value_cache[layer_idx][:, :, :, self.quant_val_len:(self.quant_val_len+to_quant_len)].copy_(value_min)
-            self.quant_val_len += to_quant_len
+                self.trans_quantize_value_cache_ubits[layer_idx][:, :, :, self.quant_val_lens[layer_idx]//(8//self.v_bits):(self.quant_val_lens[layer_idx]+to_quant_len)//(8//self.v_bits)].copy_(value_states_quant_ubits)
+                self.trans_quantize_value_cache_lbits[layer_idx][:, :, :, self.quant_val_lens[layer_idx]//(8//self.v_bits):(self.quant_val_lens[layer_idx]+to_quant_len)//(8//self.v_bits)].copy_(value_states_quant_lbits)
+                self.trans_scale_value_cache[layer_idx][:, :, :, self.quant_val_lens[layer_idx]:(self.quant_val_lens[layer_idx]+to_quant_len)].copy_(value_scale)
+                self.trans_min_value_cache[layer_idx][:, :, :, self.quant_val_lens[layer_idx]:(self.quant_val_lens[layer_idx]+to_quant_len)].copy_(value_min)
+                self.quant_val_lens[layer_idx] += to_quant_len
 
     

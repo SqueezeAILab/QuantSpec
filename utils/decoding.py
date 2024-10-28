@@ -134,7 +134,8 @@ def QuantSpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, top_k
         speculation_probs = []
         for i in range(gamma):
             # print(i)
-            spec_engine.engine.draft_cache.seq_len -= i
+            # spec_engine.engine.draft_cache.seq_len -= i
+            spec_engine.engine.draft_cache.update_seq_lens(-i)
             logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,:i+1])
             # spec_engine.engine.draft_cache.print_status()
             # logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,i:i+1])
@@ -145,8 +146,7 @@ def QuantSpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, top_k
             # draft_count += 1
         draft_count += gamma
 
-
-        spec_engine.engine.target_cache.seq_len -= gamma
+        spec_engine.engine.target_cache.update_seq_lens(-gamma)
         
         logits = spec_engine.inference(input_ids=verify_tokens)
 
@@ -182,9 +182,11 @@ def QuantSpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, top_k
                 print("EOS"*20, flush=True)
                 break
         
-        spec_engine.engine.target_cache.seq_len -= (gamma - count)
+        # spec_engine.engine.target_cache.seq_len -= (gamma - count)
         # spec_engine.engine.draft_cache.seq_len -= max(0,(gamma - count - 1))
+        spec_engine.engine.target_cache.update_seq_lens(-(gamma - count))
 
+        
         if count == gamma:
             n += 1
             pred_token_idx = sample(verify_probs[-1])
@@ -202,7 +204,7 @@ def QuantSpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, top_k
     acceptance_rate = accepted_count / draft_count
     avg_tokens = accepted_count / draft_count * gamma
     if verbose:
-        print(f"Use {time2 - time1} sec to generate {n} tokens (now {spec_engine.engine.target_cache.seq_len} tokens), Tokens/s: {n / (time2 - time1)}", flush=True)
+        print(f"Use {time2 - time1} sec to generate {n} tokens (now {spec_engine.engine.target_cache.seq_lens[-1]} tokens), Tokens/s: {n / (time2 - time1)}", flush=True)
         print(f"accepted rate {acceptance_rate}, avg generated tokens {avg_tokens}")
 
     return acceptance_rate, n / (time2 - time1)
