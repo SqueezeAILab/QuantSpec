@@ -406,3 +406,7 @@ llama 3.1 8b simqant dynamic gs 0, gs, 8192, 4, 4, 128
 0.9243088176977778, [0.9649122807017544, 0.8531746031746031, 0.9401709401709402, 0.9649122807017544, 0.8983739837398373], 87.02983081433204
 llama 3.1 8b simqant dynamic gs 0, gs, 8192, 4, 4, 128
 llama 3.1 8b simqant dynamic gs 0, gs, 8192, 4, 4, 128
+llama 3.1 8b simqant dynamic gs 0, gs, 16384, 4, 4, 128
+llama 3.1 8b simqant dynamic gs 0, gs, 16384, 4, 4, 128
+llama 3.1 8b simqant dynamic gs 0, gs, 16384, 4, 4, 128
+llama 3.1 8b simqant dynamic gs 0, gs, 16384, 4, 4, 128

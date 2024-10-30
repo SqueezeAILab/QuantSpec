@@ -814,9 +814,21 @@ class LlamaModel_SimQuant(LlamaPreTrainedModel_SimQuant):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+            
+            new_device = decoder_layer.input_layernorm.weight.device
+            if hidden_states.device != new_device:
+                hidden_states = hidden_states.to(new_device)
+                causal_mask = causal_mask.to(new_device)
+                position_ids = position_ids.to(new_device)
+                cache_position = cache_position.to(new_device)
+
+                cos, sin = position_embeddings
+                cos = cos.to(new_device)
+                sin = sin.to(new_device)
+                position_embeddings = (cos, sin)
 
             if self.gradient_checkpointing and self.training:
                 assert False, "No training and checkpointing"
@@ -851,6 +863,9 @@ class LlamaModel_SimQuant(LlamaPreTrainedModel_SimQuant):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+        
+        if hidden_states.device != self.norm.weight.device:
+            hidden_states = hidden_states.to(self.norm.weight.device)
 
         hidden_states = self.norm(hidden_states)
 
