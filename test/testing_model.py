@@ -9,9 +9,9 @@ import torch
 from transformers import AutoTokenizer, LlamaConfig
 from tqdm import tqdm
 from data.dataset import get_dataset
-from models.modelling_llama_simquantkv import LlamaForCausalLM_KIVI445 as LlamaForCausalLM_SimKIVI445
-from models.cache import QCache, SimQCache
-from models.modelling_llama_quantkv import LlamaForCausalLM_KIVI445
+from models.cache import QCache, SimQCacheV2, SimQCache
+from models.modelling_llama_simquantkv import LlamaForCausalLM_SimQuant
+from models.modelling_llama_quantkv import LlamaForCausalLM_Quant
 from utils.misc import seed_everything
 import torch.nn as nn
 import argparse
@@ -31,7 +31,7 @@ def parse_arguments():
     parser.add_argument('--v_bits', type=int, default=4, help='v_bits')
     parser.add_argument('--group_size', type=int, default=32, help='group_size')
     parser.add_argument('--residual_length', type=int, default=32, help='residual_length')
-    parser.add_argument('--num_examples', type=int, default=20, help='number of examples')
+    parser.add_argument('--num_examples', type=int, default=40, help='number of examples')
     parser.add_argument('--include_error', action='store_true', help='whether to include error in sensitivity')
 
     # Benchmarking and profiling
@@ -63,7 +63,7 @@ def llm_eval(model, cache, input_ids, args):
     
     batch_size, total_length = input_ids.shape
     n_samples = total_length // args.prefill
-    chunk_size = 1024  # Size of chunks for processing
+    chunk_size = args.prefill  # Size of chunks for processing
     nlls = []
     grads = {}
 
@@ -110,8 +110,8 @@ def llm_eval(model, cache, input_ids, args):
                     v = v_proj.act.data.reshape(1, chunk_size, model.config.num_key_value_heads, model.config.head_dim).float().cpu()
                     k_error = k - simulate_quant(k.clone().transpose(1, 3), bits=cache.k_bits, group_size=cache.group_size).transpose(1,3)
                     v_error = v - simulate_quant(v.clone(), bits=cache.v_bits, group_size=cache.group_size)
-                    import IPython
-                    IPython.embed()
+                    # import IPython
+                    # IPython.embed()
 
                     assert k_error.shape == kgrad.shape
                     assert v_error.shape == vgrad.shape
@@ -176,14 +176,18 @@ if __name__ == "__main__":
     config._attn_implementation = args.attn
     config.residual_length = args.residual_length # corresponding to the number of recent fp16 tokens
     CACHE_DIR = args.cache_dir
-    config.grads = None
-    config.k_threshold = None
-    config.v_threshold = None
+    config.precision='lower'
+    # config.first_few_fp16_layers = 0
+    config.first_few_fp16_layers = config.num_hidden_layers
+    config.calculate_sensitivity = True
+    # config.grads = None
+    # config.k_threshold = None
+    # config.v_threshold = None
 
-    if args.quantized:
-        model_class = LlamaForCausalLM_SimKIVI445
+    if args.simquant:
+        model_class = LlamaForCausalLM_SimQuant
     else:
-        model_class = LlamaForCausalLM_KIVI445  
+        model_class = LlamaForCausalLM_Quant  
 
     model = model_class.from_pretrained(
         pretrained_model_name_or_path=args.model,
@@ -212,6 +216,7 @@ if __name__ == "__main__":
         cache = QCache(model, max_budget=args.prefill+16)
 
     for dataset in ["wikitext2"]:
+        cache.reset()
         tokenized_prompts = get_dataset(dataset_name=dataset, tokenizer=tokenizer, datalen=args.prefill)
         llm_eval(model, cache, tokenized_prompts[0], args)
     

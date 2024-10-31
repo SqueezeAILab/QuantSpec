@@ -16,12 +16,21 @@ fi
 #     --identifier_string "llama 3.1 8b simqant dynamic gs 0"
 # done
 
-for prefill in 16000
+for prefill in 1024
 do
-    CUDA_VISIBLE_DEVICES=$1 TOKENIZERS_PARALLELISM=false python test/spec.py --verbose --draft meta-llama/Meta-Llama-3.1-8B --target meta-llama/Meta-Llama-3.1-8B --k_bits 4 --v_bits 4 --group_size 128 --residual_length 128 --gen_len 256 --gamma 6 --top_p 0.0 --temp 0.0 \
+    CUDA_VISIBLE_DEVICES=$1 TOKENIZERS_PARALLELISM=false python test/testing_model.py --model meta-llama/Llama-2-7b-hf --k_bits 4 --v_bits 4 --group_size 128 --residual_length 128 \
     --prefill $prefill \
-    --identifier_string "llama 3.1 8b simqant dynamic gs 0"
+    --simquant \
+    --include_error \
+    --filename "llama_2_7b_simquant_k4v4_gs128_rl0_sensitivity.json"
 done
+
+# for prefill in 16000
+# do
+#     CUDA_VISIBLE_DEVICES=$1 TOKENIZERS_PARALLELISM=false python test/spec.py --verbose --draft meta-llama/Meta-Llama-3.1-8B --target meta-llama/Meta-Llama-3.1-8B --k_bits 4 --v_bits 4 --group_size 128 --residual_length 128 --gen_len 256 --gamma 6 --top_p 0.0 --temp 0.0 \
+#     --prefill $prefill \
+#     --identifier_string "llama 3.1 8b simqant dynamic gs 0"
+# done
 
 
 

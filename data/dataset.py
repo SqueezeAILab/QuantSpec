@@ -89,5 +89,27 @@ def get_dataset(dataset_name, tokenizer=None, datalen=None, task=None):
         tokenized_prompts.append(tokenizer.encode(" ".join(dataset[0:1100]['text']), return_tensors="pt")[:, :(256*datalen)])
         return tokenized_prompts
     
+    elif dataset_name == 'multi_lexsum':
+        shots = 0
+        all_data = load_dataset("allenai/multi_lexsum", name="v20230518", cache_dir='/rscratch/rishabhtiwari/cache/')
+        all_data = all_data.filter(lambda x: x["summary/short"] is not None)
+
+        user_template = "You are given the legal documents in a civil rights lawsuit, and you are tasked to summarize the case. Write a concise summary of one paragraph (200 to 250 words). The summary should contain a short description of the background, the parties involved, and the outcomes of the case.\n\n{demo}Legal documents:\n{context}"
+        system_template = "\n\nNow please summarize the case. Summary:"
+        all_data = all_data['test']
+        all_data = all_data.map(lambda x: {
+            "context": '\n\n'.join(x["sources"]),
+            "demo": "",
+            "answer": x["summary/short"],
+            "question": "",
+        })
+        tokenized_prompts = []
+        system_template_len = len(tokenizer.encode(system_template, return_tensors="pt"))
+        for i in range(20):
+            tokenized_prompt = tokenizer.encode(user_template.format(demo="", context=all_data['context'][i]), return_tensors="pt")[:datalen-system_template_len]
+            tokenized_prompt = torch.cat((tokenized_prompt, tokenizer.encode(system_template, return_tensors="pt")), axis=1)
+            tokenized_prompts.append(tokenized_prompt)
+        return tokenized_prompts
+    
     else:
         raise Exception("Dataset not found")

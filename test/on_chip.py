@@ -74,7 +74,7 @@ if __name__ == "__main__":
     config.residual_length = args.residual_length # corresponding to the number of recent fp16 tokens
     
     config.mixed_precision = None if not args.mixed_precision else args.mixed_precision
-    config.precision='higher'
+    config.precision='lower'
 
     target_config = copy.deepcopy(config)
 
