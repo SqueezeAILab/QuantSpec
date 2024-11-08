@@ -29,14 +29,14 @@ extra_compile_args = {
 }
 
 setup(
-    name="kivi_saxpy",
+    name="kivi_gemv",
     packages=find_packages(),
     ext_modules=[
         CUDAExtension(
-            name="kivi_saxpy",
+            name="kivi_gemv",
             sources=[
-                "csrc/pybind_saxpy.cpp", 
-                "csrc/saxpy.cu"
+                "csrc/pybind.cpp", 
+                "csrc/gemv_cuda.cu"
             ],
             extra_compile_args=extra_compile_args,
         ),

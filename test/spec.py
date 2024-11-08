@@ -18,12 +18,13 @@ from utils.misc import print_config, log_csv, seed_everything
 from utils.graph_infer import GraphInferenceEngine
 from transformers import AutoTokenizer, LlamaConfig
 import copy
+import numpy as np
 seed_everything(43)
 
 import argparse
 def parse_arguments():
     parser = argparse.ArgumentParser(description='args for main.py')
-    parser.add_argument('--cache_dir', type=str, default='/rscratch/rishabhtiwari/cache/')
+    parser.add_argument('--cache_dir', type=str, default='/home/rishabhtiwari/cache/')
     parser.add_argument('--simquant', action='store_true', help='whether to use simulated quantization')
     parser.add_argument('--first_few_fp16_layers', type=int, default=0, help='first few fp16 layers')
     parser.add_argument('--k_bits', type=int, default=4, help='k_bits')
@@ -59,6 +60,8 @@ if __name__ == "__main__":
     args = parse_arguments()
 
     config = LlamaConfig.from_pretrained(args.draft)
+    # import IPython 
+    # IPython.embed()
     config.use_cache = False
     config.calculate_sensitivity = True
     config.k_bits = args.k_bits # currently only support 4-bit
@@ -83,7 +86,7 @@ if __name__ == "__main__":
         if os.path.exists(sensitivity_filepath):
             with open(sensitivity_filepath, 'r') as f:
                 sensitivity_data = json.load(f)
-            layer_sensitivity = [sensitivity_data[f'k_proj{i}'][j]+sensitivity_data[f'v_proj{i}'][j] for i in range(config.first_few_fp16_layers, config.num_hidden_layers) for j in range(config.num_key_value_heads)]
+            layer_sensitivity = [np.mean(sensitivity_data[f'k_proj{i}'])+np.mean(sensitivity_data[f'v_proj{i}']) for i in range(config.first_few_fp16_layers, config.num_hidden_layers)]
             sorted_layer_sensitivity = sorted(layer_sensitivity, reverse=True)
             threshold_index = int(args.percentile * len(sorted_layer_sensitivity))
             threshold = sorted_layer_sensitivity[threshold_index]
@@ -91,7 +94,7 @@ if __name__ == "__main__":
             
             mixed_precision_bits = []
             for i in range(config.first_few_fp16_layers, config.num_hidden_layers):
-                if (sensitivity_data[f'k_proj{i}'][j] + sensitivity_data[f'v_proj{i}'][j]) > threshold:
+                if (np.mean(sensitivity_data[f'k_proj{i}'])+np.mean(sensitivity_data[f'v_proj{i}'])) > threshold:
                     mixed_precision_bits.append(args.k_bits)
                 else:
                     mixed_precision_bits.append(2*args.k_bits)
@@ -129,13 +132,14 @@ if __name__ == "__main__":
     device_map=layer_device_map[0]
     )
     
-    target = target_class.from_pretrained(
-    pretrained_model_name_or_path=args.target,
-    config=target_config,
-    cache_dir=CACHE_DIR,
-    torch_dtype=torch.float16,
-    device_map=layer_device_map[0]
-    )
+    # target = target_class.from_pretrained(
+    # pretrained_model_name_or_path=args.target,
+    # config=target_config,
+    # cache_dir=CACHE_DIR,
+    # torch_dtype=torch.float16,
+    # device_map=layer_device_map[0]
+    # )
+    target = draft
 
     draft.model.layer_device_map = layer_device_map
     target.model.layer_device_map = layer_device_map
@@ -203,9 +207,25 @@ if __name__ == "__main__":
         acceptance_rate, speed = decoding_fn(tokenizer, spec_engine, input_ids, gamma=gamma, max_len=gen_len, top_k=top_k, top_p=top_p, temperature=temperature, verbose=verbose, file_path=None, dataset=args.dataset)
         all_acceptance_rate.append(acceptance_rate)
         all_speed.append(speed)
+
+    draft_speed = 1.92
+    verification_speed = 3.1
+    target_speed = 3.76
     
+
+    def expected_length(gamma, acceptance_rate):
+        return (1-acceptance_rate**(gamma+1))/(1-acceptance_rate)
+
+    def threoretical_speedup(draft_speed, verification_speed, target_speed, gamma, acceptance_rate):
+        expected_draft_length = expected_length(gamma, acceptance_rate)
+        return (expected_draft_length*target_speed)/(gamma*draft_speed + verification_speed)
+    
+    avg_speedup = threoretical_speedup(draft_speed, verification_speed, target_speed, 6, sum(all_acceptance_rate) / len(all_acceptance_rate))
+    worst_speedup = threoretical_speedup(draft_speed, verification_speed, target_speed, 6, min(all_acceptance_rate))
     method_latency = 1000/(sum(all_speed) / len(all_speed))
+    print(colored(f"acceptance rates (NOT per token): {all_acceptance_rate}", "red"))
     print(colored(f"average acceptance rate (NOT per token): {sum(all_acceptance_rate) / len(all_acceptance_rate)}", "red"))
-    print(colored(f"[SpecQuant] average latency: {method_latency} ms", "red"))
-    
+    print(colored(f"std deviation of acceptance rate: {np.std(all_acceptance_rate)}", "red"))
+    print(colored(f"[SpecQuant] average speedup: {avg_speedup}", "red"))
+    print(colored(f"[SpecQuant] worst speedup: {worst_speedup}", "red"))
     log_csv(log_file, None, f"{sum(all_acceptance_rate) / len(all_acceptance_rate)}, {str(all_acceptance_rate)}, {method_latency}\n")

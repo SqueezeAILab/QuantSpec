@@ -39,10 +39,10 @@ def SimQuantSpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, to
         speculation_probs = []
         for i in range(gamma):
             # print(i)
-            spec_engine.engine.draft_cache.update_seq_lens(-i)
-            logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,:i+1])
+            # spec_engine.engine.draft_cache.update_seq_lens(-i)
+            # logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,:i+1])
             # spec_engine.engine.draft_cache.print_status()
-            # logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,i:i+1])
+            logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,i:i+1])
             prob = norm_logits(logits_[:,-1,:], temperature=temperature ,top_k=top_k, top_p=top_p).squeeze()
             speculation_probs.append(prob)
             next_token = sample(prob)
@@ -105,6 +105,7 @@ def SimQuantSpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, to
     if verbose:
         print(f"Use {time2 - time1} sec to generate {n} tokens (now {spec_engine.engine.target_cache.seq_lens[-1]} tokens), Tokens/s: {n / (time2 - time1)}", flush=True)
         print(f"accepted rate {acceptance_rate}, avg generated tokens {avg_tokens}")
+    print(f"draft count {draft_count}, resample count {resample_count}", flush=True)
 
     return acceptance_rate, n / (time2 - time1)
 
@@ -136,10 +137,10 @@ def QuantSpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, top_k
         for i in range(gamma):
             # print(i)
             # spec_engine.engine.draft_cache.seq_len -= i
-            spec_engine.engine.draft_cache.update_seq_lens(-i)
-            logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,:i+1])
+            # spec_engine.engine.draft_cache.update_seq_lens(-i)
+            # logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,:i+1])
             # spec_engine.engine.draft_cache.print_status()
-            # logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,i:i+1])
+            logits_ = spec_engine.draft_inference(input_ids=verify_tokens[:,i:i+1])
             prob = norm_logits(logits_[:,-1,:], temperature=temperature ,top_k=top_k, top_p=top_p).squeeze()
             speculation_probs.append(prob)
             next_token = sample(prob)
@@ -207,5 +208,5 @@ def QuantSpecDecode(tokenizer, spec_engine, input_ids, gamma, max_len=256, top_k
     if verbose:
         print(f"Use {time2 - time1} sec to generate {n} tokens (now {spec_engine.engine.target_cache.seq_lens[-1]} tokens), Tokens/s: {n / (time2 - time1)}", flush=True)
         print(f"accepted rate {acceptance_rate}, avg generated tokens {avg_tokens}")
-
+    # print(f"draft count {draft_count}, resample count {resample_count}", flush=True)
     return acceptance_rate, n / (time2 - time1)

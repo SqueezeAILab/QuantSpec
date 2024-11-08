@@ -1,4 +1,4 @@
-from datasets import load_dataset
+from datasets import load_dataset, Value, Sequence, Features
 from tqdm import tqdm
 import secrets
 import random
@@ -32,7 +32,7 @@ def get_dataset(dataset_name, tokenizer=None, datalen=None, task=None):
         d_files = os.listdir(datasetparent)
         dataset = load_dataset("json", data_files = [datasetparent + name for name in d_files], split = "train")
         tokenized_prompts = []
-        for i in tqdm(range(20)):
+        for i in tqdm(range(5)):
             prompt = dataset[i]['text']
             tokenized_prompt = tokenizer.encode(prompt, return_tensors="pt")
             tokenized_prompts.append(tokenized_prompt)
@@ -91,7 +91,7 @@ def get_dataset(dataset_name, tokenizer=None, datalen=None, task=None):
     
     elif dataset_name == 'multi_lexsum':
         shots = 0
-        all_data = load_dataset("allenai/multi_lexsum", name="v20230518", cache_dir='/rscratch/rishabhtiwari/cache/')
+        all_data = load_dataset("allenai/multi_lexsum", name="v20230518", cache_dir='/home/rishabhtiwari/cache/')
         all_data = all_data.filter(lambda x: x["summary/short"] is not None)
 
         user_template = "You are given the legal documents in a civil rights lawsuit, and you are tasked to summarize the case. Write a concise summary of one paragraph (200 to 250 words). The summary should contain a short description of the background, the parties involved, and the outcomes of the case.\n\n{demo}Legal documents:\n{context}"
@@ -104,12 +104,44 @@ def get_dataset(dataset_name, tokenizer=None, datalen=None, task=None):
             "question": "",
         })
         tokenized_prompts = []
-        system_template_len = len(tokenizer.encode(system_template, return_tensors="pt"))
-        for i in range(20):
-            tokenized_prompt = tokenizer.encode(user_template.format(demo="", context=all_data['context'][i]), return_tensors="pt")[:datalen-system_template_len]
-            tokenized_prompt = torch.cat((tokenized_prompt, tokenizer.encode(system_template, return_tensors="pt")), axis=1)
-            tokenized_prompts.append(tokenized_prompt)
-        return tokenized_prompts
+        system_template_len = tokenizer.encode(system_template, return_tensors="pt").shape[-1]
+        i=0
+        while len(tokenized_prompts) < 6:
+
+            tokenized_prompt = tokenizer.encode(user_template.format(demo="", context=all_data['context'][i]), return_tensors="pt")
+            if tokenized_prompt.shape[-1] > 124928-system_template_len:
+                tokenized_prompt = tokenized_prompt[:, :datalen-system_template_len]
+                tokenized_prompt = torch.cat((tokenized_prompt, tokenizer.encode(system_template, return_tensors="pt")), axis=1)
+                tokenized_prompts.append(tokenized_prompt)
+            i+=1
+        return tokenized_prompts[1:]
     
+    elif dataset_name == 'infinitebench':
+        ft = Features({"id": Value("int64"), "context": Value("string"), "input": Value("string"), "answer": Sequence(Value("string")), "options": Sequence(Value("string"))})
+        data = load_dataset("xinrongzhang2022/infinitebench", features=ft, cache_dir='/home/rishabhtiwari/cache/')
+        def process_example(example):
+            update = {"question": example["input"], "demo": ""}
+            return update    
+
+        data = data["longbook_sum_eng"].map(process_example)
+        user_template = "You are given a book and you are tasked to summarize it. Write a summary of about 200 to 250 words. Only write about the plot and characters of the story. Do not discuss the themes or background of the book. Do not provide any analysis or commentary.\n\n{context}"
+        system_template = "\n\nNow summarize the book. Summary:"
+        prompt_template = user_template + "\n\n" + system_template
+
+        tokenized_prompts = []
+        system_template_len = tokenizer.encode(system_template, return_tensors="pt").shape[-1]
+
+        i = 0
+        while len(tokenized_prompts) < 6:
+            # import IPython
+            # IPython.embed()
+            tokenized_prompt = tokenizer.encode(user_template.format(context=data[i]['context']), return_tensors="pt")
+            if tokenized_prompt.shape[-1] > 124928-system_template_len:
+                tokenized_prompt = tokenized_prompt[:, :datalen-system_template_len]
+                tokenized_prompt = torch.cat((tokenized_prompt, tokenizer.encode(system_template, return_tensors="pt")), axis=1)
+                tokenized_prompts.append(tokenized_prompt)
+            i+=1
+        return tokenized_prompts[1:]
+
     else:
         raise Exception("Dataset not found")

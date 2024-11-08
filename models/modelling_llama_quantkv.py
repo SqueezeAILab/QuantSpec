@@ -51,8 +51,8 @@ from transformers.utils import (
     is_flash_attn_greater_or_equal_2_10,
     is_torchdynamo_compiling,
 )
-from quant_kivi.new_pack import triton_quantize_and_pack_along_last_dim
-from quant_kivi.matmul import cuda_bmm_fA_qB_outer, triton_bmm_fA_qB_outer
+# from quant_kivi.new_pack import triton_quantize_and_pack_along_last_dim
+# from quant_kivi.matmul import cuda_bmm_fA_qB_outer, triton_bmm_fA_qB_outer
 import math
 import numpy as np
 from kernels.flashdecoding.int8_upperlower.int8kv_upperlower_flash_decoding import token_decode_attention_int8kv_upperlower_flash_decoding
@@ -196,7 +196,7 @@ class LlamaFlashAttention2_Quant(LlamaAttention_Quant):
             cos, sin = self.rotary_emb(value_states, position_ids)
         else:
             cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -232,9 +232,9 @@ class LlamaFlashAttention2_Quant(LlamaAttention_Quant):
                     q=query_states, \
                     cache_quant_k_upper=key_states_quant_ubits, cache_quant_k_lower=key_states_quant_lbits, cache_scale_k=key_scale, cache_min_k=key_min, \
                     cache_quant_v_upper=trans_value_states_quant_ubits, cache_quant_v_lower=trans_value_states_quant_lbits, cache_scale_v=trans_value_scale, cache_min_v=trans_value_min, \
-                    kbit=self.k_bits, vbit=self.v_bits, group_size=self.group_size, full_k=key_states_full, full_v=value_states_full, out=None, alloc_tensor_func=torch.zeros, precision=self.mixed_bits
+                    kbit=self.k_bits, vbit=self.v_bits, group_size=self.group_size, full_k=key_states_full, full_v=value_states_full, out=None, alloc_tensor_func=torch.zeros, precision=self.mixed_bits if query_states.shape[-2]==1 else 8
                 )
-                torch.cuda.synchronize(device='cuda:0')
+                # torch.cuda.synchronize(device='cuda:0')
                 # if query_states.shape[2]>1 and self.layer_idx==5:
                 #     import IPython
                 #     IPython.embed()
@@ -417,6 +417,87 @@ class LlamaPreTrainedModel_Quant(LlamaPreTrainedModel):
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True
 
+def _yarn_get_mscale(scale=1):
+    if scale <= 1:
+        return 1.0
+    return 0.1 * math.log(scale) + 1.0
+
+def _yarn_find_correction_dim(num_rotations, dim, base=10000, max_position_embeddings=2048):
+    return (dim * math.log(max_position_embeddings/(num_rotations * 2 * math.pi)))/(2 * math.log(base))
+
+def _yarn_find_correction_range(low_rot, high_rot, dim, base=10000, max_position_embeddings=2048):
+    low = math.floor(_yarn_find_correction_dim(
+        low_rot, dim, base, max_position_embeddings))
+    high = math.ceil(_yarn_find_correction_dim(
+        high_rot, dim, base, max_position_embeddings))
+    return max(low, 0), min(high, dim-1)  # Clamp values just in case
+
+def _yarn_linear_ramp_mask(min, max, dim):
+    if min == max:
+        max += 0.001  # Prevent singularity
+
+    linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+    ramp_func = torch.clamp(linear_func, 0, 1)
+    return ramp_func
+
+class LlamaYaRNRotaryEmbedding(nn.Module):
+    def __init__(self, dim=128, max_position_embeddings=131072, base=10000, 
+                 scaling_factor=32.0, pos_idx_in_fp32=True, 
+                 original_max_position_embeddings=4096,
+                 extrapolation_factor=1, attn_factor=1, beta_fast=32, beta_slow=1,
+                 device=None):
+        super().__init__()
+
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.device = device
+        self.scaling_factor = scaling_factor
+        self.pos_idx_in_fp32 = pos_idx_in_fp32
+        self.original_max_position_embeddings = original_max_position_embeddings if original_max_position_embeddings else max_position_embeddings
+        self.extrapolation_factor = extrapolation_factor
+        self.attn_factor = attn_factor
+        self.beta_fast = beta_fast
+        self.beta_slow = beta_slow
+        self.mscale = float(_yarn_get_mscale(self.scaling_factor) * attn_factor)
+        # compute inverse frequency
+        self._compute_inv_freq(self.scaling_factor, device)
+        
+
+    def _compute_inv_freq(self, scaling_factor, device=None):
+        pos_freqs = self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
+        inv_freq_extrapolation = 1.0 / pos_freqs
+        inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
+
+        low, high = _yarn_find_correction_range(self.beta_fast, self.beta_slow, self.dim, self.base, self.original_max_position_embeddings)
+        inv_freq_mask = (1 - _yarn_linear_ramp_mask(low, high, self.dim // 2).float().to(device)) * self.extrapolation_factor # Get n-d rotational scaling corrected for extrapolation
+        inv_freq = inv_freq_interpolation * (1 - inv_freq_mask) + inv_freq_extrapolation * inv_freq_mask
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # Build here to make `torch.jit.trace` work.
+        self._set_cos_sin_cache(
+            seq_len=self.max_position_embeddings, device=self.inv_freq.device
+        )
+
+    def _set_cos_sin_cache(self, seq_len, device):
+        self.max_seq_len_cached = seq_len
+        if self.pos_idx_in_fp32:
+            dtype = torch.float32
+        else:
+            dtype= torch.float16
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=dtype)
+        if self.inv_freq.dtype != dtype:
+            self.inv_freq = self.inv_freq.to(dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", (emb.cos() * self.mscale).to(torch.float16), persistent=False)
+        self.register_buffer("sin_cached", (emb.sin() * self.mscale).to(torch.float16), persistent=False)
+
+    def forward(self, x, seq_len=None):
+        return (
+            self.cos_cached.to(dtype=x.dtype),
+            self.sin_cached.to(dtype=x.dtype),
+        )
 
 class LlamaModel_Quant(LlamaPreTrainedModel_Quant):
     """
@@ -436,7 +517,18 @@ class LlamaModel_Quant(LlamaPreTrainedModel_Quant):
             [LlamaDecoderLayer_Quant(config, layer_idx=layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        if self.config.rope_scaling is None:
+            self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        else:
+            scaling_type = self.config.rope_scaling["type"]
+            scaling_factor = self.config.rope_scaling["factor"]
+            if scaling_type == "yarn":
+                original_max_position_embeddings = self.config.rope_scaling["original_max_position_embeddings"]
+                self.rotary_emb = LlamaYaRNRotaryEmbedding(
+                    self.config.head_dim, base=10000, scaling_factor=scaling_factor,
+                    max_position_embeddings=self.config.max_position_embeddings,
+                    original_max_position_embeddings=original_max_position_embeddings,
+                )
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
