@@ -52,7 +52,7 @@ def get_dataset(dataset_name, tokenizer=None, datalen=None, task=None):
         return tokenized_prompts
 
     elif dataset_name == 'demo':
-        dataset = load_dataset("narrativeqa", cache_dir='/rscratch/rishabhtiwari/cache/')
+        dataset = load_dataset("narrativeqa")
         idx = [0, 50, 300, 800, 950, 1100, 2150, 2450, 2550, 2750, 3350, 3400, 3600, 3900, 4000, 4100, 4200, 4400, 4500, 4550]
         tokenized_prompts = []
         tokenized_prompt = build_chat_input_lwm(tokenizer, dataset['train'][idx[2]]['document']['text'][3:1024*500])
@@ -72,7 +72,7 @@ def get_dataset(dataset_name, tokenizer=None, datalen=None, task=None):
         return tokenized_prompts
     
     elif dataset_name == 'wikitext2':
-        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test", cache_dir='/rscratch/rishabhtiwari/cache/')
+        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
         tokenized_prompts = []
         tokenized_prompts.append(tokenizer.encode("\n\n".join(dataset['text']), return_tensors="pt"))
         return tokenized_prompts
@@ -84,14 +84,14 @@ def get_dataset(dataset_name, tokenizer=None, datalen=None, task=None):
             data_files={"validation": "en/c4-validation.00000-of-00008.json.gz"},
             split="validation",
             use_auth_token=False,
-            cache_dir='/rscratch/rishabhtiwari/cache/'
+            use_auth_token=False
         )
         tokenized_prompts.append(tokenizer.encode(" ".join(dataset[0:1100]['text']), return_tensors="pt")[:, :(256*datalen)])
         return tokenized_prompts
     
     elif dataset_name == 'multi_lexsum':
         shots = 0
-        all_data = load_dataset("allenai/multi_lexsum", name="v20230518", cache_dir='/home/rishabhtiwari/cache/')
+        all_data = load_dataset("allenai/multi_lexsum", name="v20230518")
         all_data = all_data.filter(lambda x: x["summary/short"] is not None)
 
         user_template = "You are given the legal documents in a civil rights lawsuit, and you are tasked to summarize the case. Write a concise summary of one paragraph (200 to 250 words). The summary should contain a short description of the background, the parties involved, and the outcomes of the case.\n\n{demo}Legal documents:\n{context}"
@@ -118,7 +118,7 @@ def get_dataset(dataset_name, tokenizer=None, datalen=None, task=None):
     
     elif dataset_name == 'infinitebench':
         ft = Features({"id": Value("int64"), "context": Value("string"), "input": Value("string"), "answer": Sequence(Value("string")), "options": Sequence(Value("string"))})
-        data = load_dataset("xinrongzhang2022/infinitebench", features=ft, cache_dir='/home/rishabhtiwari/cache/')
+        data = load_dataset("xinrongzhang2022/infinitebench", features=ft)
         def process_example(example):
             update = {"question": example["input"], "demo": ""}
             return update    

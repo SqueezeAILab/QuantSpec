@@ -24,7 +24,7 @@ seed_everything(43)
 import argparse
 def parse_arguments():
     parser = argparse.ArgumentParser(description='args for main.py')
-    parser.add_argument('--cache_dir', type=str, default='/home/rishabhtiwari/cache/')
+    parser.add_argument('--cache_dir', type=str, default=None, help='HuggingFace cache directory')
     parser.add_argument('--simquant', action='store_true', help='whether to use simulated quantization')
     parser.add_argument('--first_few_fp16_layers', type=int, default=0, help='first few fp16 layers')
     parser.add_argument('--k_bits', type=int, default=4, help='k_bits')

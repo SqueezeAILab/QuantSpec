@@ -4,5 +4,10 @@
 *.DS_Store
 *.so
 *.egg-info
+*.prof
+*.pstats
 __pycache__
 build
+.ipynb_checkpoints
+*.ipynb
+on_chip_results.txt

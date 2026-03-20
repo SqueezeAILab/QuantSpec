@@ -21,7 +21,7 @@ def parse_arguments():
     # Model configuration
     parser.add_argument('--model', type=str, default='meta-llama/Meta-Llama-3.1-8B', help='model')
     parser.add_argument('--attn', type=str, default='flash_attention_2', help='attention implementation')
-    parser.add_argument('--cache_dir', type=str, default='/rscratch/rishabhtiwari/cache/')
+    parser.add_argument('--cache_dir', type=str, default=None, help='HuggingFace cache directory')
     parser.add_argument('--prefill', type=int, default=2048, help='prefill')
 
     # Quantization settings
