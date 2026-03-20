@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# CUDA / Triton
+*.cubin
+*.fatbin
+*.ptx
+
+# IDE
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data / checkpoints (large files)
+checkpoints/
+*.pth
+*.bin
+*.safetensors
+*.marlin.*
+
+# Profiling
+*.json
+!Data/pg19/*.json
+
+# Environment
+.env
+*.log
